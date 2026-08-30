@@ -1,13 +1,14 @@
+# Never a key, not even a throwaway test one. Keys are generated in memory or
+# not the barrier.
+# under a temporary directory outside every repository; this line is the net,
+*.cdr
+*.dmg
+*.got
+*.img
+*.pem
+*.test
+*_host_key*
+cov.out
 cover.out
 coverage.out
-cov.out
-*.test
-*.img
-*.dmg
-*.cdr
-# Never a key, not even a throwaway test one. Keys are generated in memory or
-# under a temporary directory outside every repository; this line is the net,
-# not the barrier.
-*.pem
 id_ed25519*
-*_host_key*
