@@ -29,9 +29,9 @@ func fixture() *memFS {
 // a driver that has the Opener capability and one that does not, and requires
 // byte-for-byte the same answer.
 //
-// Both paths exist because no driver in the fleet implements Opener yet, so
-// the fallback is the one that actually runs today — and the day one does,
-// this test is what says the change is invisible to a client.
+// Both paths exist because Opener is optional: a driver that has it takes
+// the linear path, one that has not falls back to whole-file reads. This
+// test is what says that choice is invisible to a client.
 func TestReadThroughOpenerAndThroughFallback(t *testing.T) {
 	want := bytes.Repeat([]byte("0123456789abcdef"), 512)
 	for _, tc := range []struct {

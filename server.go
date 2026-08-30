@@ -30,7 +30,7 @@ var ErrNilFilesystem = errors.New("sftp: nil filesystem")
 type Server struct {
 	fsys filesystem.Filesystem
 	// opener is the driver's random-access capability, or nil. See
-	// [openerFor]; no driver in the fleet has it yet.
+	// [openerFor]; nil when the driver cannot do random access.
 	opener filesystem.Opener
 	ro     bool
 	// maxPacket caps one SFTP packet. Zero means [wire.MaxPacket].

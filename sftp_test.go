@@ -191,6 +191,60 @@ func TestNoPathEscapesTheExport(t *testing.T) {
 	c.finish()
 }
 
+// TestNoSymlinkEscapesTheExport is the second half of the containment proof.
+//
+// Path traversal is the obvious escape and TestNoPathEscapesTheExport covers
+// it. A symlink is the subtle one: the image itself contains a pointer at the
+// host, so the escape is DATA the server was handed rather than a string a
+// client invented. If the server resolved links, a link reading "/etc/passwd"
+// or "../../../../etc/passwd" would be a straight read of the host's file.
+//
+// This server never resolves a symlink. READLINK hands the target back
+// verbatim — lying about what the image stores would be its own bug — and the
+// client then re-sends that target as an ordinary path, where [clean] clamps
+// it exactly as it clamps anything else. The proof below runs that full
+// round trip: read the link, then follow it the way a client would, and show
+// the bytes come from inside the image.
+func TestNoSymlinkEscapesTheExport(t *testing.T) {
+	fsys := newMemFS()
+	fsys.addDir("/etc")
+	// The decoy. The HOST also has /etc/passwd; if a link ever escaped, the
+	// contents would differ and this test would say so.
+	fsys.addFile("/etc/passwd", []byte("in-the-image\n"), 0o100644)
+	fsys.addLink("/absolute", "/etc/passwd")
+	fsys.addLink("/relative", "../../../../etc/passwd")
+	fsys.addLink("/mixed", "/../..//etc/./passwd")
+
+	c := dial(t, fsys)
+	for _, link := range []string{"/absolute", "/relative", "/mixed"} {
+		// 1. READLINK returns the target unmodified: the server does not
+		//    rewrite what the image holds.
+		typ, payload := c.do(wire.PathRequest{
+			PacketType: wire.FxpReadlink, ID: c.next(), Path: link,
+		})
+		if typ != wire.FxpName {
+			t.Fatalf("readlink(%q) reply type %d, want SSH_FXP_NAME", link, typ)
+		}
+		n, err := wire.DecodeName(payload)
+		if err != nil {
+			t.Fatalf("DecodeName: %v", err)
+		}
+		target := n.Items[0].Filename
+
+		// 2. Follow it the way a client does — send the target back as a
+		//    path. This is where containment has to hold, and it is the
+		//    step an attacker actually performs.
+		h := c.open(target, wire.FxfRead)
+		got := c.readAll(h, 4096)
+		c.closeHandle(h)
+		if string(got) != "in-the-image\n" {
+			t.Fatalf("following %q (target %q) read %q; it must resolve inside the export",
+				link, target, got)
+		}
+	}
+	c.finish()
+}
+
 func TestPathsWithNULAreRefused(t *testing.T) {
 	c := dial(t, newMemFS())
 	typ, payload := c.do(wire.PathRequest{PacketType: wire.FxpStat, ID: c.next(), Path: "/a\x00b"})

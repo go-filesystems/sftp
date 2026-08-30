@@ -556,10 +556,13 @@ func (s *session) readAt(id uint32, f filesystem.File, off uint64, n int) wire.M
 // readWhole serves a READ from a driver with no Opener, by reading the entire
 // file and slicing it.
 //
-// This is the fallback, and at the time of writing it is the path every real
-// driver takes, because none implements Opener yet. It costs one full-file
+// This is the fallback for a driver with no Opener. It costs one full-file
 // read PER REQUEST: an OpenSSH client reads in 32 KiB chunks, so fetching an
 // n-byte file reads n²/32768 bytes in total. The README measures it.
+//
+// fat32 v0.3.0 implements Opener, so the fleet's reference driver takes the
+// linear path above; formats that cannot answer a byte range without decoding
+// everything before it (whole-file compression) land here and should.
 //
 // Reading the file once at OPEN and serving from that copy would make it
 // linear, and is deliberately not done: it converts a time cost into a
