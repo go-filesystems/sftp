@@ -12,9 +12,23 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/go-filesystems/sftp/fat32demo/demo"
 )
 
-func main() { os.Exit(demo.Main(os.Args[1:], os.Stdout, os.Stderr)) }
+// main is the signal wiring and nothing else; every decision the command makes
+// lives in package demo, which the coverage gate covers. Ctrl-C and SIGTERM
+// cancel the context, which closes the server and lets the image close
+// cleanly — an image whose server was SIGKILLed is one whose last writes may
+// not have reached the medium.
+func main() { os.Exit(run()) }
+
+func run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return demo.Main(ctx, os.Args[1:], os.Stdout, os.Stderr)
+}

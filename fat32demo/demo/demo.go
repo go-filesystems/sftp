@@ -24,6 +24,7 @@
 package demo
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -46,6 +47,18 @@ var ErrNoImage = errors.New("demo: -image is required")
 // authorises everybody is a hole. There is deliberately no "allow any key"
 // switch, not even for a demo — such switches get copied into deployments.
 var ErrNoAuthorizedKeys = errors.New("demo: -authorized-keys is required")
+
+// openImage and generateHostKey are the two calls Build makes that can fail
+// for reasons no argument can provoke: a corrupt image is reachable from a
+// test, but a driver returning a nil filesystem, or a system CSPRNG that has
+// stopped answering, are not. They are indirected here — the same device
+// go-filesystems/nfs uses for crypto/rand.Read — so the branches that handle
+// them are exercised rather than merely written. Both are the real function
+// in every build; only a test replaces them.
+var (
+	openImage       = fat32.Open
+	generateHostKey = sshd.GenerateHostKey
+)
 
 // Options is the parsed command line. It is a struct rather than a set of
 // globals so the test can drive Run directly without a process.
@@ -88,7 +101,7 @@ func ParseArgs(args []string, out io.Writer) (Options, error) {
 // ephemeral key generated in memory.
 func hostKeys(o Options) ([]ssh.Signer, error) {
 	if o.HostKey == "" {
-		k, err := sshd.GenerateHostKey()
+		k, err := generateHostKey()
 		if err != nil {
 			return nil, err
 		}
@@ -113,9 +126,26 @@ func hostKeys(o Options) ([]ssh.Signer, error) {
 // port — and so that a failure to open the image is reported before anything
 // is bound.
 func Build(o Options) (*sshd.Server, func() error, error) {
-	fsys, err := fat32.Open(o.Image, o.Partition)
+	fsys, err := openImage(o.Image, o.Partition)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open image: %w", err)
+	}
+
+	// sftp.New comes FIRST, before anything else that can fail, and that
+	// ordering is deliberate. Its only error is a nil filesystem, so putting
+	// it here makes it the one guard against a driver returning (nil, nil) —
+	// and every error path below is then free to close fsys knowing it is
+	// non-nil. With the call further down, an unchecked nil would surface as
+	// a panic inside a cleanup path, which is the least debuggable place it
+	// could possibly appear.
+	var opts []sftp.Option
+	if o.ReadWrite {
+		opts = append(opts, sftp.ReadWrite())
+	}
+	srv, err := sftp.New(fsys, opts...)
+	if err != nil {
+		// Nothing to close: the only way here is fsys being nil.
+		return nil, nil, err
 	}
 	ak, err := os.ReadFile(o.AuthorizedKeys)
 	if err != nil {
@@ -133,15 +163,6 @@ func Build(o Options) (*sshd.Server, func() error, error) {
 		return nil, nil, err
 	}
 
-	var opts []sftp.Option
-	if o.ReadWrite {
-		opts = append(opts, sftp.ReadWrite())
-	}
-	srv, err := sftp.New(fsys, opts...)
-	if err != nil {
-		fsys.Close()
-		return nil, nil, err
-	}
 	d, err := sshd.New(srv, sshd.Config{HostKeys: hk, AuthorizedKeys: keys})
 	if err != nil {
 		fsys.Close()
@@ -154,8 +175,18 @@ func Build(o Options) (*sshd.Server, func() error, error) {
 	return d, fsys.Close, nil
 }
 
-// Run builds the server and serves until it is closed.
-func Run(o Options) error {
+// Run builds the server and serves until ctx is cancelled.
+//
+// The context is what makes this a program rather than a demo: a server that
+// can only be stopped by killing the process has no chance to close the image
+// it is writing to, and an image closed by SIGKILL is an image whose last
+// writes may not be on the medium. Cancelling ctx closes the listener, drops
+// the connections, and lets the deferred close of the filesystem run.
+//
+// out receives the one line naming the address actually bound, which matters
+// because -addr may name port 0 and the caller then has no other way to learn
+// which port it got.
+func Run(ctx context.Context, o Options, out io.Writer) error {
 	d, closeFS, err := Build(o)
 	if err != nil {
 		return err
@@ -165,18 +196,28 @@ func Run(o Options) error {
 	if err != nil {
 		return err
 	}
-	// The listening address is printed because -addr may name port 0, and a
-	// caller that asked for an ephemeral port has no other way to learn which
-	// one it got.
-	fmt.Printf("serving %s on %s\n", o.Image, ln.Addr())
-	return d.Serve(ln)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		<-ctx.Done()
+		_ = d.Close()
+	}()
+	fmt.Fprintf(out, "serving %s on %s\n", o.Image, ln.Addr())
+	err = d.Serve(ln)
+	// Cancellation is a clean stop, not a failure: it is what a person
+	// pressing Ctrl-C asked for.
+	if errors.Is(err, sshd.ErrServerClosed) && ctx.Err() != nil {
+		err = nil
+	}
+	<-stopped
+	return err
 }
 
 // Main is the whole command, returning a process exit code.
 //
-// main.go is one call to this, so that everything the command does is in a
-// package the coverage gate covers.
-func Main(args []string, out, errOut io.Writer) int {
+// main.go is one call to this plus the signal wiring, so that everything the
+// command decides is in a package the coverage gate covers.
+func Main(ctx context.Context, args []string, out, errOut io.Writer) int {
 	o, err := ParseArgs(args, errOut)
 	if err != nil {
 		// flag.ContinueOnError has already printed the usage for a parse
@@ -187,7 +228,7 @@ func Main(args []string, out, errOut io.Writer) int {
 		fmt.Fprintln(errOut, err)
 		return 2
 	}
-	if err := Run(o); err != nil && !errors.Is(err, sshd.ErrServerClosed) {
+	if err := Run(ctx, o, out); err != nil && !errors.Is(err, sshd.ErrServerClosed) {
 		fmt.Fprintln(errOut, err)
 		return 1
 	}
