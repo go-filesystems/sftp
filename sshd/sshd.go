@@ -93,6 +93,30 @@ type Config struct {
 	// in".
 	AuthorizedKeys []ssh.PublicKey
 
+	// PublicKeyFor authenticates a key against the user offering it. Nil —
+	// the default — means the flat [Config.AuthorizedKeys] set decides, which
+	// accepts any listed key from any user name.
+	//
+	// It exists because a server with several people on it needs to know
+	// WHOSE key it just saw: alice's key must not log bob in, or the view
+	// chosen by [Config.ServerFor] is chosen from a name nobody proved.
+	PublicKeyFor func(user string, key ssh.PublicKey) bool
+
+	// TrustedUserCAs are the certificate authorities whose user certificates
+	// this server accepts, the way OpenSSH's TrustedUserCAKeys does.
+	//
+	// A certificate carries its own principals, validity window and critical
+	// options, all signed. Checking it is not the same as checking a key, and
+	// doing it in a caller's callback means every caller reimplements the
+	// validity window: this hands it to x/crypto/ssh's CertChecker, which
+	// verifies the signature, refuses one that is out of date, and requires
+	// the connection's user name to be among the certificate's principals.
+	//
+	// A certificate makes the fleet's problem go away: one CA is trusted here
+	// and a person's access is issued and expires elsewhere, so no file on
+	// this machine has to be edited when somebody joins or leaves.
+	TrustedUserCAs []ssh.PublicKey
+
 	// Password authenticates by password. Nil — the default — means no
 	// password authentication at all, and the client is not offered it.
 	//
@@ -160,7 +184,8 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 	if len(cfg.HostKeys) == 0 {
 		return nil, ErrNoHostKey
 	}
-	if len(cfg.AuthorizedKeys) == 0 && cfg.Password == nil {
+	if len(cfg.AuthorizedKeys) == 0 && cfg.Password == nil &&
+		cfg.PublicKeyFor == nil && len(cfg.TrustedUserCAs) == 0 {
 		return nil, ErrNoAuthorizedKeys
 	}
 
@@ -178,17 +203,39 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 	// Only the methods that can actually succeed are offered. A server that
 	// advertises password authentication it cannot perform makes every client
 	// prompt a person for something that will be refused.
-	if len(cfg.AuthorizedKeys) > 0 {
-		sc.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if _, ok := allowed[string(key.Marshal())]; !ok {
-				// The message reaches the server's caller, not the
-				// client: OpenSSH tells a client only that
-				// authentication failed, which is the right amount to
-				// tell someone who has not proved who they are.
-				return nil, fmt.Errorf("sshd: public key not authorized")
-			}
+	byKey := func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		if cfg.PublicKeyFor != nil && cfg.PublicKeyFor(meta.User(), key) {
 			return &ssh.Permissions{}, nil
 		}
+		if _, ok := allowed[string(key.Marshal())]; ok {
+			return &ssh.Permissions{}, nil
+		}
+		// The message reaches the server's caller, not the client: OpenSSH
+		// tells a client only that authentication failed, which is the right
+		// amount to tell someone who has not proved who they are.
+		return nil, fmt.Errorf("sshd: public key not authorized")
+	}
+	switch {
+	case len(cfg.TrustedUserCAs) > 0:
+		// A certificate is checked by CertChecker -- signature, validity
+		// window, and the connection's user name among the principals -- and
+		// a plain key falls through to the same check as without a CA.
+		trusted := make(map[string]struct{}, len(cfg.TrustedUserCAs))
+		for _, ca := range cfg.TrustedUserCAs {
+			trusted[string(ca.Marshal())] = struct{}{}
+		}
+		checker := &ssh.CertChecker{
+			IsUserAuthority: func(auth ssh.PublicKey) bool {
+				_, ok := trusted[string(auth.Marshal())]
+				return ok
+			},
+		}
+		if len(cfg.AuthorizedKeys) > 0 || cfg.PublicKeyFor != nil {
+			checker.UserKeyFallback = byKey
+		}
+		sc.PublicKeyCallback = checker.Authenticate
+	case len(cfg.AuthorizedKeys) > 0 || cfg.PublicKeyFor != nil:
+		sc.PublicKeyCallback = byKey
 	}
 	if cfg.Password != nil {
 		verify := cfg.Password
