@@ -152,6 +152,10 @@ func TestEachConnectionSeesItsOwn(t *testing.T) {
 			case "bob":
 				return bobSrv, nil
 			}
+			if user == "nobody" {
+				// The shape of a caller's map lookup that missed.
+				return nil, nil
+			}
 			return nil, errors.New("no such user here")
 		},
 	})
@@ -165,6 +169,18 @@ func TestEachConnectionSeesItsOwn(t *testing.T) {
 		done()
 		if err != nil || string(got) != tc.want {
 			t.Errorf("%s read %q (%v), want %q", tc.user, got, err, tc.want)
+		}
+	}
+
+	// A ServerFor that hands back nothing, without saying why, is the same
+	// refusal: there is no view, so there is no connection. It is a mistake a
+	// caller makes (a map lookup that missed, returned bare), and it must not
+	// come out as a server that accepts the connection and then dereferences
+	// nil.
+	if ch, done, err := channelAs(t, addr, hostPub, "nobody", ssh.Password("open")); err == nil {
+		defer done()
+		if _, err := readOver(t, ch, "/mine.txt"); err == nil {
+			t.Error("a connection with no view of its own was served anyway")
 		}
 	}
 
