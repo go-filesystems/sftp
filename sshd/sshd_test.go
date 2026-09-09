@@ -102,7 +102,7 @@ func harness(t *testing.T, fsys filesystem.Filesystem, extra ...func(*Config)) (
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listenLoopback(t)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestHandleConnRejectsANonSSHPeer(t *testing.T) {
 	// A real socket, not net.Pipe: the SSH handshake writes its version
 	// banner before reading anything, and an unbuffered pipe with nobody
 	// reading would deadlock instead of failing.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listenLoopback(t)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -541,4 +541,10 @@ func TestAChannelThatCannotBeAcceptedEndsTheConnection(t *testing.T) {
 	if _, err := conn.NewSession(); err == nil {
 		t.Fatal("a session was granted although the channel could not be accepted")
 	}
+}
+
+// listenLoopback binds a port the kernel chooses, on loopback.
+func listenLoopback(t *testing.T) (net.Listener, error) {
+	t.Helper()
+	return net.Listen("tcp", "127.0.0.1:0")
 }
