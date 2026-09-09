@@ -84,10 +84,40 @@ type Config struct {
 	// long-lived deployment supplies a stable key here.
 	HostKeys []ssh.Signer
 
-	// AuthorizedKeys are the client public keys permitted to connect, at
-	// least one. Comparison is over the full marshalled key, not a
-	// fingerprint, so a truncated or mangled entry fails closed.
+	// AuthorizedKeys are the client public keys permitted to connect.
+	// Comparison is over the full marshalled key, not a fingerprint, so a
+	// truncated or mangled entry fails closed.
+	//
+	// Either this or [Config.Password] must say how somebody authenticates;
+	// a Config with neither is refused rather than treated as "let everyone
+	// in".
 	AuthorizedKeys []ssh.PublicKey
+
+	// Password authenticates by password. Nil — the default — means no
+	// password authentication at all, and the client is not offered it.
+	//
+	// It exists because not every caller's users have SSH keys. A server
+	// exporting a disk image to the people in an office authenticates them
+	// the way the other protocols in the family do, and asking each of them
+	// for a key first would make SFTP the one nobody uses. The comparison
+	// belongs to the caller, which is where the passwords are; do it in
+	// constant time.
+	Password func(user, password string) bool
+
+	// ServerFor chooses what a connection sees, by user. Nil — the default —
+	// means every connection gets the single [github.com/go-filesystems/sftp.Server]
+	// passed to [New], which is the shape this package started with.
+	//
+	// It is what lets one daemon serve several people without serving them
+	// each other's files: the caller hands back a Server over whatever that
+	// user may see, and the connection can reach nothing else. A user this
+	// returns an error for is disconnected, not given an empty view --
+	// "you have nothing here" and "you are not welcome" are different
+	// answers and a client acts differently on them.
+	//
+	// It runs AFTER authentication, so the name it is given is one the
+	// client proved.
+	ServerFor func(user string) (*sftp.Server, error)
 
 	// Banner, if non-empty, is sent to the client before authentication.
 	Banner string
@@ -96,12 +126,21 @@ type Config struct {
 // Server accepts SSH connections and serves the SFTP subsystem on them.
 //
 // It holds one [github.com/go-filesystems/sftp.Server], which holds one
-// filesystem. Serving several tenants means several of these, one per
-// process; that is the isolation boundary, and it is why nothing here is
-// parameterised by user.
+// filesystem -- unless [Config.ServerFor] is set, in which case each
+// connection is handed a view chosen from the user it authenticated as.
+//
+// Both shapes are honest, and they are for different things. One process per
+// tenant is the STRONGER boundary: separate address spaces, separate images
+// open, whatever the operating system offers for confining a process. A view
+// per connection is one process, and what separates two people in it is this
+// package's own code. Use the first where the tenants do not trust each other;
+// the second is for a server whose users are already on the same footing --
+// several people in an office reaching several shares -- where a process each
+// would be a port each.
 type Server struct {
-	sftp *sftp.Server
-	cfg  *ssh.ServerConfig
+	sftp      *sftp.Server
+	serverFor func(user string) (*sftp.Server, error)
+	cfg       *ssh.ServerConfig
 
 	mu     sync.Mutex
 	closed bool
@@ -111,14 +150,17 @@ type Server struct {
 }
 
 // New builds a front-end for srv.
+//
+// srv may be nil when [Config.ServerFor] is set: the connection's view is then
+// decided per user, and there is no single server to hold.
 func New(srv *sftp.Server, cfg Config) (*Server, error) {
-	if srv == nil {
+	if srv == nil && cfg.ServerFor == nil {
 		return nil, ErrNilServer
 	}
 	if len(cfg.HostKeys) == 0 {
 		return nil, ErrNoHostKey
 	}
-	if len(cfg.AuthorizedKeys) == 0 {
+	if len(cfg.AuthorizedKeys) == 0 && cfg.Password == nil {
 		return nil, ErrNoAuthorizedKeys
 	}
 
@@ -132,8 +174,12 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 		allowed[string(k.Marshal())] = struct{}{}
 	}
 
-	sc := &ssh.ServerConfig{
-		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	sc := &ssh.ServerConfig{}
+	// Only the methods that can actually succeed are offered. A server that
+	// advertises password authentication it cannot perform makes every client
+	// prompt a person for something that will be refused.
+	if len(cfg.AuthorizedKeys) > 0 {
+		sc.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if _, ok := allowed[string(key.Marshal())]; !ok {
 				// The message reaches the server's caller, not the
 				// client: OpenSSH tells a client only that
@@ -142,7 +188,16 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 				return nil, fmt.Errorf("sshd: public key not authorized")
 			}
 			return &ssh.Permissions{}, nil
-		},
+		}
+	}
+	if cfg.Password != nil {
+		verify := cfg.Password
+		sc.PasswordCallback = func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			if !verify(meta.User(), string(password)) {
+				return nil, fmt.Errorf("sshd: password not accepted")
+			}
+			return &ssh.Permissions{}, nil
+		}
 	}
 	if cfg.Banner != "" {
 		sc.BannerCallback = func(ssh.ConnMetadata) string { return cfg.Banner }
@@ -150,7 +205,7 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 	for _, k := range cfg.HostKeys {
 		sc.AddHostKey(k)
 	}
-	return &Server{sftp: srv, cfg: sc, conns: make(map[net.Conn]struct{})}, nil
+	return &Server{sftp: srv, serverFor: cfg.ServerFor, cfg: sc, conns: make(map[net.Conn]struct{})}, nil
 }
 
 // GenerateHostKey returns a fresh in-memory Ed25519 host key.
@@ -321,7 +376,18 @@ func (d *Server) Close() error {
 // It is exported because a program that already accepts its own TCP
 // connections — a supervisor multiplexing tenants, say — can hand them here
 // without this package owning a listener.
-func (d *Server) HandleConn(c net.Conn) error {
+func (d *Server) HandleConn(c net.Conn) (err error) {
+	// A connection contains its own crash. Serve's comment already says a
+	// failed connection is one client's problem and must not be a panic path;
+	// this is what makes that true when something unexpected happens anyway --
+	// including in a callback the CALLER supplied, which this package cannot
+	// vouch for. One client's bad day is not every client's.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("sshd: connection panicked: %v", r)
+		}
+	}()
+
 	conn, chans, reqs, err := ssh.NewServerConn(c, d.cfg)
 	if err != nil {
 		// Includes every authentication failure, which is the common case
@@ -329,6 +395,19 @@ func (d *Server) HandleConn(c net.Conn) error {
 		return err
 	}
 	defer conn.Close()
+
+	// What this connection may see. It is resolved once, here, from a user
+	// name the client has just PROVED -- not from anything it says later.
+	srv := d.sftp
+	if d.serverFor != nil {
+		srv, err = d.serverFor(conn.User())
+		if err != nil {
+			return err
+		}
+		if srv == nil {
+			return fmt.Errorf("sshd: no filesystem for %q", conn.User())
+		}
+	}
 
 	// Global requests are keepalives and port-forwarding asks. Nothing here
 	// serves either; discarding them (which replies "no" to those wanting an
@@ -351,7 +430,7 @@ func (d *Server) HandleConn(c net.Conn) error {
 		d.wg.Add(1)
 		go func() {
 			defer d.wg.Done()
-			d.handleSession(ch, chReqs)
+			d.handleSession(srv, ch, chReqs)
 		}()
 	}
 	return nil
@@ -369,8 +448,11 @@ type subsystemRequest struct {
 // "shell" and "exec" are refused. That is the difference between this and an
 // SSH server: there is no shell here to give anyone, and a client that asks
 // for one must be told no rather than left waiting.
-func (d *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
+func (d *Server) handleSession(srv *sftp.Server, ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
+	// Its own, because this runs in its own goroutine: a recover in
+	// HandleConn's frame cannot catch what happens here.
+	defer func() { _ = recover() }()
 	for req := range reqs {
 		if req.Type != "subsystem" {
 			replyNo(req)
@@ -384,7 +466,7 @@ func (d *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 		replyYes(req)
 		// Serve owns the channel until the client closes it. Any error is
 		// this one client's; the connection's other channels are unaffected.
-		_ = d.sftp.Serve(ch)
+		_ = srv.Serve(ch)
 		// SFTP is the whole session. Sending the exit status is what makes
 		// a client's own `sftp` process exit 0 instead of reporting that
 		// the remote command died without status.
