@@ -117,6 +117,23 @@ type Config struct {
 	// this machine has to be edited when somebody joins or leaves.
 	TrustedUserCAs []ssh.PublicKey
 
+	// CertificateFor authenticates a certificate that NONE of
+	// [Config.TrustedUserCAs] signed, and returns the permissions of the
+	// login -- which [Config.ServerForLogin] is then given.
+	//
+	// It exists for certificates whose authority is not a key at all: an
+	// OpenPubkey (opkssh) certificate is signed by the user's OWN key and
+	// carries, in an extension, an ID token from an identity provider that
+	// commits to that key. Only the caller can check that proof.
+	//
+	// Before it is called, the certificate has passed everything a
+	// certificate is checked for WITHOUT trusting its signer: it is a user
+	// certificate, signed by the key it names as its signer, inside its
+	// validity window, and -- when it lists principals -- listing this user.
+	// What the signer's key is worth is the question left, and it is the
+	// callback's whole job.
+	CertificateFor func(user string, cert *ssh.Certificate) (*ssh.Permissions, error)
+
 	// Password authenticates by password. Nil — the default — means no
 	// password authentication at all, and the client is not offered it.
 	//
@@ -143,6 +160,13 @@ type Config struct {
 	// client proved.
 	ServerFor func(user string) (*sftp.Server, error)
 
+	// ServerForLogin is [Config.ServerFor] with the permissions the login
+	// was granted: a certificate's extensions, or what
+	// [Config.CertificateFor] returned. A caller that decides by more than a
+	// name -- the groups an identity provider said somebody is in -- reads
+	// them here. When both are set, this one is used.
+	ServerForLogin func(user string, perms *ssh.Permissions) (*sftp.Server, error)
+
 	// Banner, if non-empty, is sent to the client before authentication.
 	Banner string
 }
@@ -162,9 +186,10 @@ type Config struct {
 // several people in an office reaching several shares -- where a process each
 // would be a port each.
 type Server struct {
-	sftp      *sftp.Server
-	serverFor func(user string) (*sftp.Server, error)
-	cfg       *ssh.ServerConfig
+	sftp           *sftp.Server
+	serverFor      func(user string) (*sftp.Server, error)
+	serverForLogin func(user string, perms *ssh.Permissions) (*sftp.Server, error)
+	cfg            *ssh.ServerConfig
 
 	mu     sync.Mutex
 	closed bool
@@ -178,14 +203,14 @@ type Server struct {
 // srv may be nil when [Config.ServerFor] is set: the connection's view is then
 // decided per user, and there is no single server to hold.
 func New(srv *sftp.Server, cfg Config) (*Server, error) {
-	if srv == nil && cfg.ServerFor == nil {
+	if srv == nil && cfg.ServerFor == nil && cfg.ServerForLogin == nil {
 		return nil, ErrNilServer
 	}
 	if len(cfg.HostKeys) == 0 {
 		return nil, ErrNoHostKey
 	}
 	if len(cfg.AuthorizedKeys) == 0 && cfg.Password == nil &&
-		cfg.PublicKeyFor == nil && len(cfg.TrustedUserCAs) == 0 {
+		cfg.PublicKeyFor == nil && len(cfg.TrustedUserCAs) == 0 && cfg.CertificateFor == nil {
 		return nil, ErrNoAuthorizedKeys
 	}
 
@@ -215,27 +240,41 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 		// amount to tell someone who has not proved who they are.
 		return nil, fmt.Errorf("sshd: public key not authorized")
 	}
-	switch {
-	case len(cfg.TrustedUserCAs) > 0:
+	keys := len(cfg.AuthorizedKeys) > 0 || cfg.PublicKeyFor != nil
+	var checker *ssh.CertChecker
+	trusted := make(map[string]struct{}, len(cfg.TrustedUserCAs))
+	if len(cfg.TrustedUserCAs) > 0 {
 		// A certificate is checked by CertChecker -- signature, validity
 		// window, and the connection's user name among the principals -- and
 		// a plain key falls through to the same check as without a CA.
-		trusted := make(map[string]struct{}, len(cfg.TrustedUserCAs))
 		for _, ca := range cfg.TrustedUserCAs {
 			trusted[string(ca.Marshal())] = struct{}{}
 		}
-		checker := &ssh.CertChecker{
+		checker = &ssh.CertChecker{
 			IsUserAuthority: func(auth ssh.PublicKey) bool {
 				_, ok := trusted[string(auth.Marshal())]
 				return ok
 			},
 		}
-		if len(cfg.AuthorizedKeys) > 0 || cfg.PublicKeyFor != nil {
+		if keys {
 			checker.UserKeyFallback = byKey
 		}
-		sc.PublicKeyCallback = checker.Authenticate
-	case len(cfg.AuthorizedKeys) > 0 || cfg.PublicKeyFor != nil:
-		sc.PublicKeyCallback = byKey
+	}
+	if checker != nil || keys || cfg.CertificateFor != nil {
+		sc.PublicKeyCallback = func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if cert, ok := key.(*ssh.Certificate); ok && cfg.CertificateFor != nil {
+				if _, byCA := trusted[string(cert.SignatureKey.Marshal())]; !byCA {
+					return selfSigned(meta.User(), cert, cfg.CertificateFor)
+				}
+			}
+			switch {
+			case checker != nil:
+				return checker.Authenticate(meta, key)
+			case keys:
+				return byKey(meta, key)
+			}
+			return nil, fmt.Errorf("sshd: public key not authorized")
+		}
 	}
 	if cfg.Password != nil {
 		verify := cfg.Password
@@ -252,7 +291,7 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 	for _, k := range cfg.HostKeys {
 		sc.AddHostKey(k)
 	}
-	return &Server{sftp: srv, serverFor: cfg.ServerFor, cfg: sc, conns: make(map[net.Conn]struct{})}, nil
+	return &Server{sftp: srv, serverFor: cfg.ServerFor, serverForLogin: cfg.ServerForLogin, cfg: sc, conns: make(map[net.Conn]struct{})}, nil
 }
 
 // GenerateHostKey returns a fresh in-memory Ed25519 host key.
@@ -446,8 +485,12 @@ func (d *Server) HandleConn(c net.Conn) (err error) {
 	// What this connection may see. It is resolved once, here, from a user
 	// name the client has just PROVED -- not from anything it says later.
 	srv := d.sftp
-	if d.serverFor != nil {
-		srv, err = d.serverFor(conn.User())
+	if d.serverFor != nil || d.serverForLogin != nil {
+		if d.serverForLogin != nil {
+			srv, err = d.serverForLogin(conn.User(), conn.Permissions)
+		} else {
+			srv, err = d.serverFor(conn.User())
+		}
 		if err != nil {
 			return err
 		}
@@ -546,4 +589,30 @@ func replyYes(req *ssh.Request) {
 	if req.WantReply {
 		_ = req.Reply(true, nil)
 	}
+}
+
+// selfSigned checks a certificate no trusted authority signed as far as a
+// certificate can be checked without trusting its signer, then asks the
+// caller what the signer's key is worth.
+func selfSigned(user string, cert *ssh.Certificate, decide func(string, *ssh.Certificate) (*ssh.Permissions, error)) (*ssh.Permissions, error) {
+	if cert.CertType != ssh.UserCert {
+		return nil, fmt.Errorf("sshd: a host certificate offered as a user's")
+	}
+	// CheckCert verifies the signature against the key the certificate
+	// names as its signer, the validity window, the principals when there
+	// are any, and refuses critical options nobody here understands.
+	own := &ssh.CertChecker{IsUserAuthority: func(auth ssh.PublicKey) bool {
+		return string(auth.Marshal()) == string(cert.SignatureKey.Marshal())
+	}}
+	if err := own.CheckCert(user, cert); err != nil {
+		return nil, err
+	}
+	perms, err := decide(user, cert)
+	if err != nil {
+		return nil, err
+	}
+	if perms == nil {
+		perms = &ssh.Permissions{}
+	}
+	return perms, nil
 }
