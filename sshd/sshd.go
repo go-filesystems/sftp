@@ -601,10 +601,9 @@ func selfSigned(user string, cert *ssh.Certificate, decide func(string, *ssh.Cer
 	// CheckCert verifies the signature against the key the certificate
 	// names as its signer, the validity window, the principals when there
 	// are any, and refuses critical options nobody here understands.
-	own := &ssh.CertChecker{IsUserAuthority: func(auth ssh.PublicKey) bool {
-		return string(auth.Marshal()) == string(cert.SignatureKey.Marshal())
-	}}
-	if err := own.CheckCert(user, cert); err != nil {
+	// (It checks the signature by cert.SignatureKey itself: IsUserAuthority is
+	// asked only by Authenticate, which is exactly what is not wanted here.)
+	if err := (&ssh.CertChecker{}).CheckCert(user, cert); err != nil {
 		return nil, err
 	}
 	perms, err := decide(user, cert)

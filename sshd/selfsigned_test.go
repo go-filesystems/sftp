@@ -126,3 +126,21 @@ func TestNewAcceptsCertificateForAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// With CertificateFor as the only way in, a bare key is refused: nothing
+// here vouches for it.
+func TestCertificateForRefusesABareKey(t *testing.T) {
+	srv, _ := sftp.New(tinyFS{files: map[string][]byte{}})
+	userSigner, _ := clientKey(t)
+	addr, _, hostPub, _ := harnessFor(t, Config{
+		// A password that is never right, so that the harness adds no
+		// authorised key of its own: certificates are the only way in.
+		Password:       func(string, string) bool { return false },
+		CertificateFor: func(string, *ssh.Certificate) (*ssh.Permissions, error) { return nil, nil },
+		ServerForLogin: func(string, *ssh.Permissions) (*sftp.Server, error) { return srv, nil },
+	})
+	if _, done, err := channelAs(t, addr, hostPub, "alice", ssh.PublicKeys(userSigner)); err == nil {
+		done()
+		t.Fatal("a bare key was admitted by a server that only takes certificates")
+	}
+}
