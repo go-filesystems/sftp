@@ -3,7 +3,7 @@ module github.com/go-filesystems/sftp
 go 1.27.1
 
 require (
-	github.com/go-filesystems/interface v0.3.0
+	github.com/go-filesystems/interface v0.4.0
 	golang.org/x/crypto v0.57.0
 )
 
