@@ -98,6 +98,34 @@ module opens no key file, consults no `~/.ssh`, and has no "allow any key"
 switch — not even in the demo, because such switches get copied into
 deployments.
 
+### Who gets in
+
+`sshd.Config` names every way in, and a `Config` that names none is refused
+with `ErrNoAuthorizedKeys` rather than read as "let everyone in":
+
+| field | what it accepts |
+|---|---|
+| `AuthorizedKeys` | a flat set of public keys, compared on their full wire form |
+| `PublicKeyFor` | a key, judged against the user name offering it |
+| `TrustedUserCAs` | user certificates signed by one of these CAs, the way OpenSSH's `TrustedUserCAKeys` does: x/crypto's `CertChecker` checks the signature, the validity window and that the user name is a principal |
+| `CertificateFor` | a certificate **no** trusted CA signed, such as an OpenPubkey (opkssh) one signed by the user's own key; the callback decides what that key is worth |
+| `Password` | a password, compared by the caller; nil means password authentication is not even offered |
+
+`ServerFor`, or `ServerForLogin` with the login's permissions (a certificate's
+extensions, or what `CertificateFor` returned), then chooses what each
+connection sees.
+
+**Critical options.** On either certificate path the only critical option
+accepted is `source-address`; a certificate carrying any other (`force-command`,
+`verify-required`, ...) is refused, because a restriction this server does not
+act on is one its issuer believes holds and does not. `source-address` is
+enforced against the connection's address on both paths. On the
+`CertificateFor` path (since v0.5.1) it is put into the permissions whatever the
+callback returns, alongside the callback's own critical options; a callback that
+sets a *different* `source-address` has the login refused. The tests dial from
+127.0.0.1, `::1` and 127.0.0.2, so a pin is matched against the connecting
+address, IPv6 included, and not merely against "loopback".
+
 ## Layout
 
 | package | depends on | why |
@@ -180,8 +208,8 @@ The wire is big-endian, so CI runs the test binaries under QEMU on **s390x**
 as well as riscv64, loong64 and ppc64le — s390x being the arch on which a
 forgotten `binary.BigEndian` would still pass on the developer's machine.
 
-Every key in the test suite is generated with `ssh-keygen` into `t.TempDir()`,
-outside every repository, and removed when the test ends. No key is read from
+Every key in the test suite is generated in memory, or with `ssh-keygen` into
+`t.TempDir()` outside every repository, and removed when the test ends. No key is read from
 or written to a fixed location, `.gitignore` refuses key shapes as a net, and
 CI fails the build if any key material or image survives in the work tree.
 
@@ -190,8 +218,9 @@ CI fails the build if any key material or image survives in the work tree.
 - **Bind to loopback** unless you have decided otherwise.
 - Read-only is the **default**; `sftp.ReadWrite()` is opt-in, because an
   accidental write to a forensic or build artefact is unrecoverable.
-- Authentication is public-key only. There is no password path, and no way to
-  authorise a key the caller did not name.
+- Nobody is let in by default. Every key, CA and callback is the caller's, and
+  a `Config` that names no way in is refused; password authentication exists
+  only when the caller supplies `Password`.
 - A server can reach **nothing but the one `Filesystem` it was given**. No host
   path, no `..` escape, no symlink out of the image.
 
