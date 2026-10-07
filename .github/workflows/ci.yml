@@ -63,8 +63,13 @@ jobs:
           CGO_ENABLED: "0"
         run: go build -mod=mod ./...
 
+      # The source-address tests dial from ::1 and from 127.0.0.2 as well as
+      # 127.0.0.1. Both exist on a Linux runner, so a skip here would be a
+      # silent no-op: the variable turns a missing address into a failure.
       - name: Test (race + coverage)
         working-directory: sftp
+        env:
+          SFTP_REQUIRE_LOOPBACK_ADDRESSES: "1"
         run: go test -mod=mod -race -coverpkg=./... -coverprofile=cover.out -covermode=atomic ./...
 
       - name: Enforce coverage gate

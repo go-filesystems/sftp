@@ -3,6 +3,7 @@ package sshd
 import (
 	"errors"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -201,6 +202,12 @@ func TestEachConnectionSeesItsOwn(t *testing.T) {
 // harnessFor is harness without the assumption that there is one filesystem.
 func harnessFor(t *testing.T, cfg Config) (string, ssh.Signer, ssh.PublicKey, *Server) {
 	t.Helper()
+	return harnessOn(t, "127.0.0.1:0", cfg)
+}
+
+// harnessOn is harnessFor listening on an address of the caller's choosing.
+func harnessOn(t *testing.T, listen string, cfg Config) (string, ssh.Signer, ssh.PublicKey, *Server) {
+	t.Helper()
 	hostKey, err := GenerateHostKey()
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +221,7 @@ func harnessFor(t *testing.T, cfg Config) (string, ssh.Signer, ssh.PublicKey, *S
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ln, err := listenLoopback(t)
+	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		t.Fatal(err)
 	}
