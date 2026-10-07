@@ -132,6 +132,14 @@ type Config struct {
 	// validity window, and -- when it lists principals -- listing this user.
 	// What the signer's key is worth is the question left, and it is the
 	// callback's whole job.
+	//
+	// The only critical option such a certificate may carry is
+	// source-address; any other is refused before the callback is asked.
+	// source-address is enforced against the connection's address whatever
+	// the callback returns: it is put into the returned permissions'
+	// CriticalOptions, alongside the callback's own. A callback that sets a
+	// DIFFERENT source-address there has the login refused, since enforcing
+	// either value alone would drop the other.
 	CertificateFor func(user string, cert *ssh.Certificate) (*ssh.Permissions, error)
 
 	// Password authenticates by password. Nil — the default — means no
@@ -591,6 +599,14 @@ func replyYes(req *ssh.Request) {
 	}
 }
 
+// sourceAddress is the one critical option a certificate on the
+// [Config.CertificateFor] path may carry. x/crypto/ssh enforces it itself,
+// against the connection's remote address, from the CriticalOptions of the
+// permissions the authentication callback returns -- which is how
+// CertChecker.Authenticate supports it on the trusted-CA path, and the only
+// way it is enforced here too.
+const sourceAddress = "source-address"
+
 // selfSigned checks a certificate no trusted authority signed as far as a
 // certificate can be checked without trusting its signer, then asks the
 // caller what the signer's key is worth.
@@ -603,7 +619,13 @@ func selfSigned(user string, cert *ssh.Certificate, decide func(string, *ssh.Cer
 	// are any, and refuses critical options nobody here understands.
 	// (It checks the signature by cert.SignatureKey itself: IsUserAuthority is
 	// asked only by Authenticate, which is exactly what is not wanted here.)
-	if err := (&ssh.CertChecker{}).CheckCert(user, cert); err != nil {
+	//
+	// source-address is understood: it is carried into the permissions
+	// below, where x/crypto/ssh enforces it. Every other critical option is
+	// still refused -- one this server does not act on would be a restriction
+	// the certificate's issuer believes holds and does not.
+	checker := ssh.CertChecker{SupportedCriticalOptions: []string{sourceAddress}}
+	if err := checker.CheckCert(user, cert); err != nil {
 		return nil, err
 	}
 	perms, err := decide(user, cert)
@@ -613,5 +635,36 @@ func selfSigned(user string, cert *ssh.Certificate, decide func(string, *ssh.Cer
 	if perms == nil {
 		perms = &ssh.Permissions{}
 	}
-	return perms, nil
+	return withSourceAddress(cert, perms)
+}
+
+// withSourceAddress puts the certificate's source-address, if it has one, into
+// the permissions x/crypto/ssh enforces it from, whatever the callback
+// returned: a callback that builds its permissions from scratch -- or returns
+// nil -- must not be the way a restriction the certificate's issuer signed is
+// dropped.
+//
+// The callback's own critical options are kept. If it set a source-address of
+// its own that differs from the certificate's, the login is refused: only one
+// value can be enforced, and either choice would silently drop a restriction
+// somebody asked for -- the issuer's, which the certificate is signed to
+// carry, or the caller's. Refusing loosens neither.
+//
+// The permissions are copied rather than written to, so a callback that hands
+// back a shared value never sees one login's restriction applied to the next.
+func withSourceAddress(cert *ssh.Certificate, perms *ssh.Permissions) (*ssh.Permissions, error) {
+	want, ok := cert.CriticalOptions[sourceAddress]
+	if !ok {
+		return perms, nil
+	}
+	if got, set := perms.CriticalOptions[sourceAddress]; set && got != want {
+		return nil, fmt.Errorf("sshd: CertificateFor returned source-address %q, the certificate carries %q", got, want)
+	}
+	out := *perms
+	out.CriticalOptions = make(map[string]string, len(perms.CriticalOptions)+1)
+	for k, v := range perms.CriticalOptions {
+		out.CriticalOptions[k] = v
+	}
+	out.CriticalOptions[sourceAddress] = want
+	return &out, nil
 }
