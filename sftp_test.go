@@ -102,8 +102,11 @@ func TestInitAboveVersionThreeNegotiatesDownToThree(t *testing.T) {
 	if v.Version != 3 {
 		t.Fatalf("negotiated %d, want 3", v.Version)
 	}
-	if len(v.Extensions) != 0 {
-		t.Fatalf("advertised extensions %v; none are implemented so none must be advertised", v.Extensions)
+	// Exactly the one extension that is implemented: an advertised one a
+	// client relies on must exist, and an unimplemented one must not be
+	// offered.
+	if len(v.Extensions) != 1 || v.Extensions[0].Type != "limits@openssh.com" || v.Extensions[0].Data != "1" {
+		t.Fatalf("advertised extensions %v; want exactly limits@openssh.com", v.Extensions)
 	}
 }
 

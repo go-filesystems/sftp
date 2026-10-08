@@ -142,6 +142,9 @@ func (s *session) opOpendir(m wire.PathRequest) wire.Message {
 	if bad != nil {
 		return bad
 	}
+	if s.handles.full() {
+		return status(m.ID, wire.StatusFailure, errTooManyHandles.Error())
+	}
 	s.srv.lock()
 	defer s.srv.unlock()
 
@@ -388,6 +391,11 @@ func (s *session) opOpen(m wire.OpenRequest) wire.Message {
 	if write && s.srv.ro {
 		return status(m.ID, wire.StatusPermissionDenied, errReadOnly)
 	}
+	// Before the driver opens anything: a refused handle must not have
+	// spent a host descriptor on the way.
+	if s.handles.full() {
+		return status(m.ID, wire.StatusFailure, errTooManyHandles.Error())
+	}
 
 	s.srv.lock()
 	defer s.srv.unlock()
@@ -521,7 +529,7 @@ func (s *session) opRead(m wire.ReadRequest) wire.Message {
 	// buffer, so it is clamped to what this server would ever agree to
 	// send. A client asking for more gets a short read, which io.ReaderAt's
 	// contract and every SFTP client both handle.
-	n := min(int(m.Length), s.srv.packetLimit())
+	n := min(int(m.Length), s.srv.readLength())
 
 	s.srv.lock()
 	defer s.srv.unlock()

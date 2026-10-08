@@ -115,6 +115,12 @@ func (t *handles) add(h *openFile) (string, error) {
 	return tok, nil
 }
 
+// full reports whether the session holds as many handles as it may. The
+// callers ask before the driver opens anything, which is the point: a
+// refused handle must not have spent a host descriptor. A session serves one
+// request at a time, so nothing comes between the question and add.
+func (t *handles) full() bool { return len(t.m) >= maxOpenHandles }
+
 // get resolves a token. A miss is a miss — there is no index to bound-check
 // and nothing to dereference.
 func (t *handles) get(tok string) (*openFile, bool) {
