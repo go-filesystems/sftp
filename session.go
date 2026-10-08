@@ -87,13 +87,13 @@ func (s *session) negotiate(r io.Reader) error {
 	// by the draft to drop to it. Every client does; this is the normal
 	// path for the few that offer more.
 	//
-	// No extensions are advertised. Each one is an operation this server
-	// would then have to implement — hardlink@openssh.com,
-	// posix-rename@openssh.com, statvfs@openssh.com — and advertising one
-	// that is not implemented is worse than silence, because a client stops
-	// falling back. A client that sees none uses the base operations, which
-	// is what this exports.
-	s.out, err = wire.Send(s.rw, wire.VersionReply{Version: wire.Version}, s.out)
+	// One extension is advertised, limits@openssh.com, and it is answered.
+	// Every other one -- hardlink@openssh.com, posix-rename@openssh.com,
+	// statvfs@openssh.com -- is an operation this server would then have to
+	// implement, and advertising one that is not implemented is worse than
+	// silence, because a client stops falling back.
+	s.out, err = wire.Send(s.rw, wire.VersionReply{Version: wire.Version,
+		Extensions: []wire.ExtendedPair{{Type: limitsExtension, Data: "1"}}}, s.out)
 	return err
 }
 
@@ -247,9 +247,12 @@ func (s *session) dispatch(typ uint8, payload []byte) wire.Message {
 		if err != nil {
 			return badMessage(id, err)
 		}
-		// No extension is advertised, so a client asking for one is asking
-		// for something it was told nothing about. Saying so lets it fall
-		// back; inventing an answer would not.
+		if m.Name == limitsExtension {
+			return s.limitsReply(m.ID)
+		}
+		// Any other extension is one this server did not advertise, so a
+		// client asking for it is asking for something it was told nothing
+		// about. Saying so lets it fall back; inventing an answer would not.
 		return status(m.ID, wire.StatusOpUnsupported, "unsupported extension: "+m.Name)
 
 	default:
