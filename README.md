@@ -147,6 +147,23 @@ Cryptography is **not** reimplemented: the transport is
 speaks) is implemented here, because the protocol is the thing this repository
 is *for*.
 
+## Extensions
+
+Two, both answered, and nothing advertised that is not:
+
+- **`limits@openssh.com`** (since v0.6.0): the server's packet, read and
+  write lengths and open-handle bound, so OpenSSH's `sftp` reads and writes
+  up to 255 KiB per request instead of 32 KiB (about +25% measured with
+  OpenSSH 10.3). One session holds at most 1024 open handles.
+- **`copy-data`** (since v0.7.0), what OpenSSH 9.0+'s `sftp cp` sends: a copy
+  from one open handle into another on the server, through
+  [`hostcopy`](https://github.com/go-filesystems/hostcopy) -- a megabyte at
+  a time, or `copy_file_range(2)` in the kernel between two files of the
+  host, which shares blocks on btrfs and XFS. Offered on a writable export
+  whose driver opens files; one file read and written at once is refused,
+  as OpenSSH does. `sftp cp` of 256 MiB through go-fileshare: 0.21 s,
+  handshake included, where the client used to download and upload it.
+
 ## The write path, measured
 
 `SSH_FXP_READ(handle, offset, len)` lands exactly on `filesystem.Opener` /

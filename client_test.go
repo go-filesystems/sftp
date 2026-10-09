@@ -35,6 +35,8 @@ type client struct {
 	// because both an explicit finish() and the test cleanup wait on it.
 	done     chan struct{}
 	serveErr error
+	// version is what the server answered INIT with.
+	version wire.VersionReply
 }
 
 // dial starts a server over a synchronous in-memory pipe and negotiates.
@@ -84,6 +86,7 @@ func (c *client) init() {
 	if v.Version != wire.Version {
 		c.t.Fatalf("negotiated version %d, want %d", v.Version, wire.Version)
 	}
+	c.version = v
 }
 
 // next returns a fresh request id. Ids are distinct so that a reply carrying
