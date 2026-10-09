@@ -87,13 +87,13 @@ func (s *session) negotiate(r io.Reader) error {
 	// by the draft to drop to it. Every client does; this is the normal
 	// path for the few that offer more.
 	//
-	// One extension is advertised, limits@openssh.com, and it is answered.
-	// Every other one -- hardlink@openssh.com, posix-rename@openssh.com,
-	// statvfs@openssh.com -- is an operation this server would then have to
-	// implement, and advertising one that is not implemented is worse than
-	// silence, because a client stops falling back.
+	// The extensions advertised are the ones answered: limits@openssh.com,
+	// and copy-data where it can copy. Every other one -- hardlink@openssh.com,
+	// posix-rename@openssh.com, statvfs@openssh.com -- is an operation this
+	// server would then have to implement, and advertising one that is not
+	// implemented is worse than silence, because a client stops falling back.
 	s.out, err = wire.Send(s.rw, wire.VersionReply{Version: wire.Version,
-		Extensions: []wire.ExtendedPair{{Type: limitsExtension, Data: "1"}}}, s.out)
+		Extensions: s.srv.extensions()}, s.out)
 	return err
 }
 
@@ -247,8 +247,11 @@ func (s *session) dispatch(typ uint8, payload []byte) wire.Message {
 		if err != nil {
 			return badMessage(id, err)
 		}
-		if m.Name == limitsExtension {
+		switch m.Name {
+		case limitsExtension:
 			return s.limitsReply(m.ID)
+		case copyDataExtension:
+			return s.copyData(m.ID, m.Data)
 		}
 		// Any other extension is one this server did not advertise, so a
 		// client asking for it is asking for something it was told nothing
