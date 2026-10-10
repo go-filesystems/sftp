@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           check-latest: true
           cache: true
           cache-dependency-path: sftp/go.mod
@@ -120,7 +120,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           check-latest: true
           cache: true
           cache-dependency-path: sftp/go.mod
@@ -212,7 +212,7 @@ jobs:
           path: sftp
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           check-latest: true
           cache: true
           cache-dependency-path: sftp/go.mod
@@ -255,7 +255,7 @@ jobs:
           path: sftp
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.2'
           check-latest: true
           cache: true
           cache-dependency-path: sftp/fat32demo/go.mod
