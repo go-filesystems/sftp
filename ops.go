@@ -3,6 +3,7 @@ package sftp
 import (
 	"errors"
 	"io"
+	"math"
 	"os"
 
 	filesystem "github.com/go-filesystems/interface"
@@ -97,6 +98,11 @@ func (s *session) opSetstat(id uint32, path string, a wire.Attributes) wire.Mess
 		t, ok := s.srv.fsys.(filesystem.Truncater)
 		if !ok {
 			return status(id, wire.StatusOpUnsupported, "driver cannot truncate")
+		}
+		// The size is a uint64 from the wire; above 2^63-1 it would reach the
+		// driver as a negative int64.
+		if a.Size > math.MaxInt64 {
+			return status(id, wire.StatusFailure, "size beyond what a file can hold")
 		}
 		if err := t.Truncate(path, int64(a.Size)); err != nil {
 			return status(id, statusFor(err, wire.StatusFailure), errText(err))
@@ -641,11 +647,10 @@ func (s *session) writeSplice(id uint32, path string, off uint64, data []byte) w
 		return status(id, statusFor(err, wire.StatusFailure), errText(err))
 	}
 	end := off + uint64(len(data))
-	if end > uint64(maxFileSplice) {
+	if end < off || (end > uint64(len(old)) && (end-uint64(len(old)) > maxSpliceGrowth || end > maxFileSplice)) {
 		// The offset is a uint64 from the wire and this is about to size a
-		// buffer with it. A client writing one byte at offset 2^63 would
-		// otherwise ask the server to materialise eight exabytes.
-		return status(id, wire.StatusFailure, "write beyond the maximum supported file size")
+		// buffer with it (end < off: it wrapped).
+		return status(id, wire.StatusFailure, "write beyond what rewriting the whole file can hold")
 	}
 	buf := old
 	if end > uint64(len(old)) {
@@ -662,8 +667,16 @@ func (s *session) writeSplice(id uint32, path string, off uint64, data []byte) w
 	return status(id, wire.StatusOK, "")
 }
 
-// maxFileSplice bounds what the read-modify-write path will materialise in
-// memory. It is generous — larger than any image the fleet's drivers open —
-// and exists only to make a hostile offset a refusal rather than an
-// allocation failure.
-const maxFileSplice = 1 << 40
+// The read-modify-write path materialises the whole file at its new end, so
+// the offset a client sends decides the allocation.
+//
+// ⛔ The bound used to be 1 TiB. It stopped the 2^63 offset its comment
+// named, and nothing a real machine would survive: one 1-byte WRITE at
+// offset 2^39 asked make() for 512 GiB. These are go-filesystems/nfs's and
+// smb's bounds for the same path: growth past the current end is limited --
+// a client writing out of order runs ahead of the end by a few chunks at
+// most -- and so is the file.
+const (
+	maxSpliceGrowth = 8 << 20
+	maxFileSplice   = 1 << 30
+)
