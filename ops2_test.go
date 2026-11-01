@@ -98,7 +98,7 @@ func TestWriteRefusals(t *testing.T) {
 		h := c.open("/x", wire.FxfWrite|wire.FxfCreat)
 		typ, p := c.do(wire.WriteRequest{ID: c.next(), Handle: h, Offset: 1 << 62, Data: []byte("x")})
 		st := c.status(typ, p, wire.StatusFailure)
-		if !strings.Contains(st.Message, "maximum supported file size") {
+		if !strings.Contains(st.Message, "rewriting the whole file") {
 			t.Fatalf("message = %q", st.Message)
 		}
 	})

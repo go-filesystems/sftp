@@ -240,6 +240,14 @@ CI fails the build if any key material or image survives in the work tree.
   only when the caller supplies `Password`.
 - A server can reach **nothing but the one `Filesystem` it was given**. No host
   path, no `..` escape, no symlink out of the image.
+- **An offset a client sends cannot size an allocation.** On a driver without
+  `WritableFile`, a WRITE rewrites the whole file at its new end; that path
+  grows a file by at most 8 MiB past its end and to at most 1 GiB, as
+  go-filesystems/nfs and smb do, and answers `SSH_FX_FAILURE` beyond. ⛔ Its
+  only bound used to be 1 TiB: one 1-byte WRITE at offset 2³⁹ asked for
+  512 GiB. A SETSTAT size above 2⁶³−1 is refused instead of reaching the
+  driver as a negative number. Packets are capped at 260 KiB and READs at
+  255 KiB, as before.
 
 ## Licence
 
