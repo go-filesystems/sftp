@@ -190,3 +190,55 @@ func TestOpenSSHLargeTransfersConcurrent(t *testing.T) {
 		ram.mu.Unlock()
 	}
 }
+
+// OpenSSH's client refuses to resume a download whose replies came back out
+// of order ("server reordered requests", sftp-client.c:1856), so a server that
+// answers concurrently must still reply in order. `get -a` of a half-fetched
+// file must finish it, byte for byte.
+func TestOpenSSHResumeAgainstConcurrentServer(t *testing.T) {
+	sftpBin, err := exec.LookPath("sftp")
+	if err != nil {
+		if os.Getenv("SFTP_REQUIRE_OPENSSH") != "" {
+			t.Fatal("OpenSSH's sftp is required here")
+		}
+		t.Skip("OpenSSH is not installed")
+	}
+	const size = 16<<20 + 321
+	src := make([]byte, size)
+	rand.Read(src)
+	srv, err := sftp.New(&ramFS{files: map[string][]byte{"/get.bin": src}}, sftp.ReadWrite())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	sshPub, _ := ssh.NewPublicKey(pub)
+	addr, _, _, _ := harnessFor(t, Config{
+		AuthorizedKeys: []ssh.PublicKey{sshPub},
+		ServerForLogin: func(string, *ssh.Permissions) (*sftp.Server, error) { return srv, nil },
+	})
+	dir := t.TempDir()
+	key := filepath.Join(dir, "id")
+	blk, _ := ssh.MarshalPrivateKey(priv, "")
+	if err := os.WriteFile(key, pem.EncodeToMemory(blk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	part := filepath.Join(dir, "part.bin")
+	if err := os.WriteFile(part, src[:9<<20], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host, port, _ := strings.Cut(addr, ":")
+	cmd := exec.Command(sftpBin, "-b", "-", "-P", port, "-i", key,
+		"-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "alice@"+host)
+	cmd.Stdin = strings.NewReader("get -a /get.bin " + part + "\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("get -a: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sha256.Sum256(got) != sha256.Sum256(src) {
+		t.Fatalf("resumed file differs (%d bytes, want %d)", len(got), size)
+	}
+}
