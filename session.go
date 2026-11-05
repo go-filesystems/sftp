@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 
 	"github.com/go-filesystems/sftp/wire"
 )
@@ -22,19 +23,19 @@ var ErrVersion = errors.New("sftp: unsupported client protocol version")
 
 // session is one SFTP conversation over one stream.
 //
-// It handles packets strictly one at a time: read, dispatch, reply, read
-// again. Clients pipeline heavily — OpenSSH keeps 64 requests outstanding —
-// so this is a real serialisation, and it is the same choice
-// [github.com/go-filesystems/nfs] makes for the same reason: the driver
-// underneath is a single *os.File that is not documented as safe for
-// concurrent use.
+// One goroutine reads packets; READ and WRITE are answered on goroutines of
+// their own, up to [WithMaxInFlight] at a time, and every other request is a
+// barrier run alone. See concurrent.go for the rules and their sources.
+// Replies go out as they complete, matched by request id.
 type session struct {
 	srv     *Server
 	rw      io.ReadWriter
 	handles *handles
+	slots   *slots
+	w       *replyWriter
+	wg      sync.WaitGroup
 
-	// in and out are reused across packets so a bulk transfer does not
-	// allocate once per 32 KiB chunk.
+	// in and out serve negotiation; requests use their slot's buffers.
 	in, out []byte
 }
 
@@ -44,10 +45,18 @@ func (s *session) run() error {
 	if err := s.negotiate(br); err != nil {
 		return err
 	}
+	// Whatever ends the loop, requests in flight are answered (or fail on
+	// the dead stream) before run returns and the handles are closed.
+	defer s.wg.Wait()
 	for {
-		typ, payload, next, err := wire.ReadPacket(br, s.in, s.srv.packetLimit())
-		s.in = next
+		if err := s.w.failure(); err != nil {
+			return err
+		}
+		sl := s.slots.acquire()
+		typ, payload, next, err := wire.ReadPacket(br, sl.in, s.srv.packetLimit())
+		sl.in = next
 		if err != nil {
+			s.slots.release(sl)
 			// A clean end of stream at a packet boundary is how a client
 			// says goodbye; it is not a failure of anything.
 			if errors.Is(err, io.EOF) {
@@ -55,9 +64,23 @@ func (s *session) run() error {
 			}
 			return err
 		}
-		msg := s.dispatch(typ, payload)
-		if s.out, err = wire.Send(s.rw, msg, s.out); err != nil {
-			return err
+		j, early := s.prepare(typ, payload)
+		switch {
+		case j != nil:
+			s.srv.ranges.acquire(&j.span)
+			s.wg.Add(1)
+			if s.slots.max == 1 {
+				s.serveJob(sl, j)
+			} else {
+				go s.serveJob(sl, j)
+			}
+		case early != nil:
+			s.reply(sl, early)
+			s.slots.release(sl)
+		default:
+			s.wg.Wait()
+			s.reply(sl, s.dispatch(typ, payload))
+			s.slots.release(sl)
 		}
 	}
 }
@@ -140,19 +163,7 @@ func (s *session) dispatch(typ uint8, payload []byte) wire.Message {
 		}
 		return s.opClose(m)
 
-	case wire.FxpRead:
-		m, err := wire.DecodeRead(payload)
-		if err != nil {
-			return badMessage(id, err)
-		}
-		return s.opRead(m)
-
-	case wire.FxpWrite:
-		m, err := wire.DecodeWrite(payload)
-		if err != nil {
-			return badMessage(id, err)
-		}
-		return s.opWrite(m)
+	// READ and WRITE never arrive here: [session.prepare] takes them.
 
 	case wire.FxpLstat, wire.FxpStat:
 		m, err := wire.DecodePath(typ, payload)

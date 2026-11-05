@@ -164,6 +164,32 @@ Two, both answered, and nothing advertised that is not:
   as OpenSSH does. `sftp cp` of 256 MiB through go-fileshare: 0.21 s,
   handshake included, where the client used to download and upload it.
 
+## Concurrent requests
+
+A session answers up to 64 requests at once (`sftp.WithMaxInFlight(n)`; 1 is
+the one-at-a-time behaviour of v0.7.0), which is what a client that pipelines
+64 `READ`s, as OpenSSH's `sftp` does, needs. Replies leave as they complete,
+matched by request id (draft-ietf-secsh-filexfer-02 §6.1, §7).
+
+- **Parallel:** `READ` and `WRITE`, through the driver's `File.ReadAt` and
+  `WritableFile.WriteAt`, which the interface module documents as safe for
+  concurrent use (writes on non-overlapping ranges only).
+- **Ordered:** a `READ` or `WRITE` waits for any request in progress on the
+  same file whose byte range overlaps it and where one of the two is a write,
+  across every session of the server. A write to a driver with no
+  `WritableFile` rewrites the whole file and so waits for everything on it.
+- **Barriers:** every other request (`OPEN`, `CLOSE`, `FSTAT`, `SETSTAT`,
+  `READDIR`, `STAT`, `RENAME`, ...) waits for all requests in flight, runs
+  alone, and only then is the next packet read. A `CLOSE` therefore follows
+  every pending operation on its handle.
+- **Driver contract:** path-based calls, `Truncate`, `Sync` and `Close` hold
+  the filesystem lock exclusively, as before; `ReadAt`/`WriteAt` hold it
+  shared. A host-directory embedder whose `Stat`, `ListDir`, `ReadFile` and
+  `ReadLink` are safe in parallel can say so with `sftp.PathOpsConcurrent()`.
+- **Bounded:** the cap is taken before a packet is read, so a client that
+  pipelines faster than the server answers waits in the transport; memory is
+  at most `n` packets in and `n` replies out per session.
+
 ## The write path, measured
 
 `SSH_FXP_READ(handle, offset, len)` lands exactly on `filesystem.Opener` /

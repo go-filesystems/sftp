@@ -39,21 +39,81 @@ type Server struct {
 	// until a driver can report a real one. See [TimeStat].
 	start uint32
 
-	// mu serialises ALL access to the exported filesystem.
+	// maxInFlight is how many requests one session may have in progress.
+	maxInFlight int
+	// pathConcurrent is the embedder's assertion that the driver's
+	// read-only path calls (Stat, ListDir, ReadFile, ReadLink) are safe
+	// concurrently with each other and with File I/O. See [PathOpsConcurrent].
+	pathConcurrent bool
+
+	// fsmu is the filesystem lock, and the driver contract made executable.
 	//
-	// A go-filesystems driver wraps a single *os.File and is not documented
-	// as safe for concurrent use: two overlapping reads would interleave
-	// seeks and hand each caller the other's bytes. That is not theoretical
-	// here — OpenSSH's sftp client pipelines up to 64 requests at once by
-	// default, which is the first thing a `get` of any real file does.
+	// The interface module documents exactly two things as safe for
+	// concurrent use: File.ReadAt, and WritableFile.WriteAt on
+	// non-overlapping ranges (interface v0.5.0, File and WritableFile).
+	// It documents NOTHING about concurrent path-based calls (Stat, ListDir,
+	// WriteFile, ...), Truncate or Sync. So:
 	//
-	// One session already serialises itself (it answers each packet before
-	// reading the next); this lock is what makes two SESSIONS against the
-	// same Server safe. Correct and ordered beats fast and wrong, and a
-	// driver that one day documents concurrency-safety can be given a
-	// parallel path without any protocol change.
-	mu sync.Mutex
+	//   - File.ReadAt and File.WriteAt hold fsmu for READING: any number run
+	//     together, ranges permitting (see [rangeSet]).
+	//   - Every path-based call, Truncate, Sync and Close holds fsmu
+	//     exclusively, and so never overlaps any File I/O or any other path
+	//     call. This is v0.7.0's behaviour for them, unchanged.
+	//   - With [PathOpsConcurrent] the read-only path calls hold it for
+	//     reading as well.
+	fsmu sync.RWMutex
+	// ranges orders overlapping reads and writes across every session.
+	ranges rangeSet
 }
+
+// lock takes the filesystem lock exclusively: for path-based mutations,
+// Truncate, Sync and Close.
+func (s *Server) lock()   { s.fsmu.Lock() }
+func (s *Server) unlock() { s.fsmu.Unlock() }
+
+// rlock is for read-only path calls: shared only if the embedder asserted
+// [PathOpsConcurrent], exclusive otherwise.
+func (s *Server) rlock() {
+	if s.pathConcurrent {
+		s.fsmu.RLock()
+	} else {
+		s.fsmu.Lock()
+	}
+}
+func (s *Server) runlock() {
+	if s.pathConcurrent {
+		s.fsmu.RUnlock()
+	} else {
+		s.fsmu.Unlock()
+	}
+}
+
+// DefaultMaxInFlight is how many requests a session may have in progress at
+// once unless [WithMaxInFlight] says otherwise: OpenSSH's sftp client keeps
+// 64 outstanding (sftp-client.c, DEFAULT_NUM_REQUESTS).
+const DefaultMaxInFlight = 64
+
+// MaxInFlightLimit is the ceiling [WithMaxInFlight] is clamped to.
+const MaxInFlightLimit = 1024
+
+// WithMaxInFlight bounds how many requests one session processes at once.
+//
+// The bound is enforced BEFORE a request is read: the session takes one of n
+// buffers first, and when none is free it stops reading, so a client that
+// pipelines faster than the server answers waits in TCP's window instead of in
+// this process's memory. Memory per session is at most n packets in and n
+// replies out. 1 restores v0.7.0's one-request-at-a-time behaviour; a
+// non-positive value means [DefaultMaxInFlight].
+func WithMaxInFlight(n int) Option {
+	return func(s *Server) { s.maxInFlight = min(n, MaxInFlightLimit) }
+}
+
+// PathOpsConcurrent asserts that the driver's read-only path calls (Stat,
+// ListDir, ReadFile, ReadLink) may run concurrently with each other and with
+// File I/O, which lets the server run them in parallel. The interface module
+// does not promise it, so the embedder has to: it is right for a host
+// directory (os calls), wrong for a driver with a shared cursor or cache.
+func PathOpsConcurrent() Option { return func(s *Server) { s.pathConcurrent = true } }
 
 // Option configures a [Server].
 type Option func(*Server)
@@ -111,19 +171,22 @@ func (s *Server) ReadOnly() bool { return s.ro }
 // when the client vanishes mid-transfer, which is what killing an `sftp`
 // process does.
 func (s *Server) Serve(rw io.ReadWriter) error {
+	n := s.maxInFlight
+	if n <= 0 {
+		n = DefaultMaxInFlight
+	}
 	sess := &session{
 		srv:     s,
 		rw:      rw,
 		handles: newHandles(),
+		slots:   newSlots(n),
+		w:       &replyWriter{w: rw},
 	}
+	// run returns only after every request in flight has been answered, so
+	// closeAll never races a READ or WRITE still holding a driver file.
 	defer sess.handles.closeAll()
 	return sess.run()
 }
-
-// lock takes the filesystem lock. Every driver call in this package is made
-// between lock and unlock; see [Server.mu].
-func (s *Server) lock()   { s.mu.Lock() }
-func (s *Server) unlock() { s.mu.Unlock() }
 
 // packetLimit returns the ceiling in force for this server.
 func (s *Server) packetLimit() int {
