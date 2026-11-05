@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -63,7 +65,7 @@ func (f benchFile) ReadAt(p []byte, off int64) (int, error) {
 
 // benchGet fetches the file over `sessions` sessions at once, each keeping
 // `depth` 32 KiB READs outstanding, the way OpenSSH's sftp client does.
-func benchGet(b *testing.B, srv *Server, size, sessions, depth int) {
+func benchGet(b *testing.B, dial dialer, path string, size, sessions, depth int) {
 	const chunk = 32 << 10
 	b.SetBytes(int64(size * sessions))
 	b.ReportAllocs()
@@ -73,18 +75,57 @@ func benchGet(b *testing.B, srv *Server, size, sessions, depth int) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				getOnce(b, srv, size, depth, chunk)
+				getOnce(b, dial, path, size, depth, chunk)
 			}()
 		}
 		wg.Wait()
 	}
 }
 
-func getOnce(b *testing.B, srv *Server, size, depth, chunk int) {
-	a, c := net.Pipe()
-	done := make(chan struct{})
-	go func() { srv.Serve(c); close(done) }()
-	defer func() { a.Close(); <-done }()
+// A dialer starts one session and returns its stream and how to end it.
+type dialer func() (io.ReadWriter, func())
+
+// inProcess serves sessions of srv over in-memory pipes.
+func inProcess(srv *Server) dialer {
+	return func() (io.ReadWriter, func()) {
+		a, c := net.Pipe()
+		done := make(chan struct{})
+		go func() { srv.Serve(c); close(done) }()
+		return a, func() { a.Close(); <-done }
+	}
+}
+
+// sftpServerBinary is OpenSSH's sftp-server, the reference.
+func sftpServerBinary() string {
+	for _, p := range []string{"/usr/libexec/sftp-server", "/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// openSSHServer starts OpenSSH's sftp-server on stdin and stdout, one process
+// per session, the way sshd does.
+func openSSHServer(bin string) dialer {
+	return func() (io.ReadWriter, func()) {
+		cmd := exec.Command(bin)
+		in, _ := cmd.StdinPipe()
+		out, _ := cmd.StdoutPipe()
+		cmd.Start()
+		return struct {
+			io.Reader
+			io.Writer
+		}{out, in}, func() {
+			in.Close()
+			cmd.Wait()
+		}
+	}
+}
+
+func getOnce(b *testing.B, dial dialer, path string, size, depth, chunk int) {
+	a, end := dial()
+	defer end()
 	var buf, in []byte
 	send := func(m wire.Message) {
 		var err error
@@ -102,7 +143,7 @@ func getOnce(b *testing.B, srv *Server, size, depth, chunk int) {
 	}
 	send(wire.InitRequest{Version: wire.Version})
 	recv()
-	send(wire.OpenRequest{ID: 1, Path: "/f", PFlags: wire.FxfRead})
+	send(wire.OpenRequest{ID: 1, Path: path, PFlags: wire.FxfRead})
 	_, p := recv()
 	h, _ := wire.DecodeHandleReply(p)
 	handle := h.Handle
@@ -139,6 +180,26 @@ func BenchmarkGet(b *testing.B) {
 		{"2sessions", 2, 64},
 	} {
 		srv, _ := New(benchFS{data})
-		b.Run(tc.name, func(b *testing.B) { benchGet(b, srv, size, tc.sessions, tc.depth) })
+		b.Run(tc.name, func(b *testing.B) { benchGet(b, inProcess(srv), "/f", size, tc.sessions, tc.depth) })
+	}
+}
+
+// BenchmarkGetOpenSSH is the same transfer against OpenSSH's own sftp-server,
+// the reference, where it is installed.
+func BenchmarkGetOpenSSH(b *testing.B) {
+	bin := sftpServerBinary()
+	if bin == "" {
+		b.Skip("no OpenSSH sftp-server here")
+	}
+	const size = 16 << 20
+	path := filepath.Join(b.TempDir(), "f")
+	if err := os.WriteFile(path, make([]byte, size), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		sessions int
+	}{{"1session", 1}, {"2sessions", 2}} {
+		b.Run(tc.name, func(b *testing.B) { benchGet(b, openSSHServer(bin), path, size, tc.sessions, 64) })
 	}
 }
