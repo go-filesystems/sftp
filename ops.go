@@ -52,8 +52,8 @@ func (s *session) opStat(m wire.PathRequest) wire.Message {
 	if bad != nil {
 		return bad
 	}
-	s.srv.lock()
-	defer s.srv.unlock()
+	s.srv.rlock()
+	defer s.srv.runlock()
 	st, err := s.srv.fsys.Stat(path)
 	if err != nil {
 		return status(m.ID, statusFor(err, wire.StatusNoSuchFile), errText(err))
@@ -151,8 +151,8 @@ func (s *session) opOpendir(m wire.PathRequest) wire.Message {
 	if s.handles.full() {
 		return status(m.ID, wire.StatusFailure, errTooManyHandles.Error())
 	}
-	s.srv.lock()
-	defer s.srv.unlock()
+	s.srv.rlock()
+	defer s.srv.runlock()
 
 	// Establishing the type explicitly, rather than inferring it from
 	// whatever error ListDir returns on a regular file, is what keeps the
@@ -189,15 +189,24 @@ func (s *session) opReaddir(m wire.HandleRequest) wire.Message {
 	if !h.dir {
 		return status(m.ID, wire.StatusFailure, "handle is not a directory")
 	}
-	if h.pos >= len(h.entries) {
-		return status(m.ID, wire.StatusEOF, "")
+	s.srv.rlock()
+	defer s.srv.runlock()
+	for h.pos < len(h.entries) {
+		end := min(h.pos+readdirBatch, len(h.entries))
+		batch := h.entries[h.pos:end]
+		h.pos = end
+		if items := s.readdirBatch(h, batch); len(items) > 0 {
+			return wire.NameReply{ID: m.ID, Items: items}
+		}
+		// Every entry in this batch was unusable. Returning an empty NAME
+		// would end some clients' loops early, so go on to the next batch.
 	}
-	end := min(h.pos+readdirBatch, len(h.entries))
-	batch := h.entries[h.pos:end]
-	h.pos = end
+	return status(m.ID, wire.StatusEOF, "")
+}
 
-	s.srv.lock()
-	defer s.srv.unlock()
+// readdirBatch builds the NAME items for one batch of a listing. The caller
+// holds the filesystem lock.
+func (s *session) readdirBatch(h *openFile, batch []filesystem.DirEntry) []wire.NameItem {
 	items := make([]wire.NameItem, 0, len(batch))
 	for _, e := range batch {
 		name := e.Name()
@@ -224,13 +233,7 @@ func (s *session) opReaddir(m wire.HandleRequest) wire.Message {
 			Attrs:    a,
 		})
 	}
-	if len(items) == 0 {
-		// Every entry in this batch was unusable. Returning an empty NAME
-		// would end some clients' loops early, so recurse onto the next
-		// batch; h.pos has already advanced, so this terminates.
-		return s.opReaddir(m)
-	}
-	return wire.NameReply{ID: m.ID, Items: items}
+	return items
 }
 
 // opRealpath answers SSH_FXP_REALPATH.
@@ -339,8 +342,8 @@ func (s *session) opReadlink(m wire.PathRequest) wire.Message {
 	if bad != nil {
 		return bad
 	}
-	s.srv.lock()
-	defer s.srv.unlock()
+	s.srv.rlock()
+	defer s.srv.runlock()
 	target, err := s.srv.fsys.ReadLink(path)
 	if err != nil {
 		return status(m.ID, statusFor(err, wire.StatusNoSuchFile), errText(err))
@@ -519,41 +522,53 @@ func (s *session) opClose(m wire.HandleRequest) wire.Message {
 	return status(m.ID, wire.StatusOK, "")
 }
 
-// opRead answers SSH_FXP_READ.
-func (s *session) opRead(m wire.ReadRequest) wire.Message {
+// readJob prepares SSH_FXP_READ: the reply at once when no driver is needed,
+// otherwise a job that runs beside others.
+func (s *session) readJob(m wire.ReadRequest) (*job, wire.Message) {
 	h, ok := s.handles.get(m.Handle)
 	if !ok {
-		return status(m.ID, wire.StatusFailure, "unknown handle")
+		return nil, status(m.ID, wire.StatusFailure, "unknown handle")
 	}
 	if h.dir {
-		return status(m.ID, wire.StatusFailure, "handle is a directory")
+		return nil, status(m.ID, wire.StatusFailure, "handle is a directory")
 	}
 	if m.Length == 0 {
-		return wire.DataReply{ID: m.ID, Data: nil}
+		return nil, wire.DataReply{ID: m.ID, Data: nil}
 	}
 	// The length is a uint32 straight off the wire and is about to size a
 	// buffer, so it is clamped to what this server would ever agree to
 	// send. A client asking for more gets a short read, which io.ReaderAt's
 	// contract and every SFTP client both handle.
 	n := min(int(m.Length), s.srv.readLength())
-
-	s.srv.lock()
-	defer s.srv.unlock()
-
-	if h.file != nil {
-		return s.readAt(m.ID, h.file, m.Offset, n)
-	}
-	return s.readWhole(m.ID, h.path, m.Offset, n)
+	sp := span{path: h.path, lo: m.Offset, hi: satAdd(m.Offset, uint64(n))}
+	return &job{span: sp, run: func(sl *slot) wire.Message {
+		if h.file != nil {
+			// File.ReadAt is documented safe for concurrent use: shared.
+			s.srv.fsmu.RLock()
+			defer s.srv.fsmu.RUnlock()
+			return s.readAt(m.ID, h.file, m.Offset, n, sl)
+		}
+		s.srv.rlock()
+		defer s.srv.runlock()
+		return s.readWhole(m.ID, h.path, m.Offset, n)
+	}}, nil
 }
 
 // readAt serves a READ from an open [github.com/go-filesystems/interface.File].
 // This is the path SSH_FXP_READ was made for: one ReadAt, no more bytes
-// touched than were asked for.
-func (s *session) readAt(id uint32, f filesystem.File, off uint64, n int) wire.Message {
-	if off >= uint64(f.Size()) {
+// touched than were asked for, into the request slot's buffer.
+//
+// File.Size is deliberately not consulted: ReadAt answers 0, io.EOF at or
+// past the end by contract, and Size of a writable file is not documented as
+// safe beside a concurrent WriteAt.
+func (s *session) readAt(id uint32, f filesystem.File, off uint64, n int, sl *slot) wire.Message {
+	if off > math.MaxInt64 {
 		return status(id, wire.StatusEOF, "")
 	}
-	buf := make([]byte, n)
+	if cap(sl.data) < n {
+		sl.data = make([]byte, n)
+	}
+	buf := sl.data[:n]
 	got, err := f.ReadAt(buf, int64(off))
 	if got > 0 {
 		// io.ReaderAt may return data together with io.EOF. Sending the
@@ -590,40 +605,53 @@ func (s *session) readWhole(id uint32, path string, off uint64, n int) wire.Mess
 	if off >= uint64(len(data)) {
 		return status(id, wire.StatusEOF, "")
 	}
-	end := min(off+uint64(n), uint64(len(data)))
+	end := min(satAdd(off, uint64(n)), uint64(len(data)))
 	return wire.DataReply{ID: id, Data: data[off:end]}
 }
 
-// opWrite answers SSH_FXP_WRITE.
-func (s *session) opWrite(m wire.WriteRequest) wire.Message {
+// writeJob prepares SSH_FXP_WRITE, like [session.readJob].
+func (s *session) writeJob(m wire.WriteRequest) (*job, wire.Message) {
 	h, ok := s.handles.get(m.Handle)
 	if !ok {
-		return status(m.ID, wire.StatusFailure, "unknown handle")
+		return nil, status(m.ID, wire.StatusFailure, "unknown handle")
 	}
 	if h.dir {
-		return status(m.ID, wire.StatusFailure, "handle is a directory")
+		return nil, status(m.ID, wire.StatusFailure, "handle is a directory")
 	}
 	if s.srv.ro {
-		return status(m.ID, wire.StatusPermissionDenied, errReadOnly)
+		return nil, status(m.ID, wire.StatusPermissionDenied, errReadOnly)
 	}
 	if !h.write {
 		// The handle was opened read-only. Refusing here rather than
 		// writing is the whole value of recording the open mode: a client
 		// that opened for reading and then wrote has a bug, and performing
 		// the write would hide it inside someone's image.
-		return status(m.ID, wire.StatusPermissionDenied, "handle not opened for writing")
+		return nil, status(m.ID, wire.StatusPermissionDenied, "handle not opened for writing")
 	}
-
-	s.srv.lock()
-	defer s.srv.unlock()
-
-	if h.writable != nil {
-		if _, err := h.writable.WriteAt(m.Data, int64(m.Offset)); err != nil {
-			return status(m.ID, statusFor(err, wire.StatusFailure), errText(err))
+	if m.Offset > math.MaxInt64 {
+		return nil, status(m.ID, wire.StatusFailure, "offset beyond what a file can hold")
+	}
+	sp := span{path: h.path, lo: m.Offset, hi: satAdd(m.Offset, uint64(len(m.Data))), write: true}
+	if h.writable == nil {
+		// No positional write: this is a rewrite of the whole file, so it
+		// orders against every other request on the path.
+		sp.lo, sp.hi = 0, math.MaxUint64
+	}
+	return &job{span: sp, run: func(*slot) wire.Message {
+		if h.writable != nil {
+			// WritableFile.WriteAt is documented safe for concurrent use on
+			// non-overlapping ranges, which the range set guarantees: shared.
+			s.srv.fsmu.RLock()
+			defer s.srv.fsmu.RUnlock()
+			if _, err := h.writable.WriteAt(m.Data, int64(m.Offset)); err != nil {
+				return status(m.ID, statusFor(err, wire.StatusFailure), errText(err))
+			}
+			return status(m.ID, wire.StatusOK, "")
 		}
-		return status(m.ID, wire.StatusOK, "")
-	}
-	return s.writeSplice(m.ID, h.path, m.Offset, m.Data)
+		s.srv.lock()
+		defer s.srv.unlock()
+		return s.writeSplice(m.ID, h.path, m.Offset, m.Data)
+	}}, nil
 }
 
 // writeSplice performs a write at an offset on a driver that has no

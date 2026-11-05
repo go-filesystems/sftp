@@ -236,6 +236,11 @@ func (m *memFS) Truncate(path string, newSize int64) error {
 	if !ok {
 		return fs.ErrNotExist
 	}
+	if newSize < 0 || newSize > 1<<26 {
+		// The fixture's own bound: a real driver refuses what its medium
+		// cannot hold, and the fuzzer found this one panicking in make().
+		return errors.New("memfs: size out of range")
+	}
 	if int64(len(n.data)) > newSize {
 		n.data = n.data[:newSize]
 		return nil
@@ -368,6 +373,9 @@ func (f *memWritableFile) WriteAt(p []byte, off int64) (int, error) {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 	end := off + int64(len(p))
+	if off < 0 || end < off || end > 1<<26 {
+		return 0, errors.New("memfs: write out of range")
+	}
 	if end > int64(len(f.node.data)) {
 		f.node.data = append(f.node.data, make([]byte, end-int64(len(f.node.data)))...)
 	}
