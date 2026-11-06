@@ -44,6 +44,8 @@ type Server struct {
 	// maxTotal is the server-wide cap: one of pool's tokens is held by every
 	// request from before its packet is read until its reply is written.
 	maxTotal int
+	// packetWait is [WithPacketTimeout].
+	packetWait time.Duration
 	// pathConcurrent is the embedder's assertion that the driver's
 	// read-only path calls (Stat, ListDir, ReadFile, ReadLink) are safe
 	// concurrently with each other and with File I/O. See [PathOpsConcurrent].
@@ -107,6 +109,30 @@ const DefaultMaxInFlightTotal = 256
 // idle or stalled connections. A non-positive value means
 // [DefaultMaxInFlightTotal].
 func WithMaxInFlightTotal(n int) Option { return func(s *Server) { s.maxTotal = n } }
+
+// DefaultPacketTimeout is how long the rest of a packet may take to arrive
+// once its first byte has, unless [WithPacketTimeout] says otherwise.
+const DefaultPacketTimeout = 30 * time.Second
+
+// WithPacketTimeout bounds how long the rest of a packet may take once its
+// first byte has arrived. The request holds a slot and a token of the
+// server-wide budget meanwhile, so without a bound a client that sends a
+// length and stops holds them for ever. A packet that is not complete in time
+// ends the session: the stream is closed (an SSH channel) or given a past read
+// deadline (a net.Conn); a stream with neither is not interrupted. Zero means
+// [DefaultPacketTimeout]; a negative value disables it. Waiting for the NEXT
+// packet is not bounded and holds nothing.
+func WithPacketTimeout(d time.Duration) Option { return func(s *Server) { s.packetWait = d } }
+
+func (s *Server) packetTimeout() time.Duration {
+	switch {
+	case s.packetWait == 0:
+		return DefaultPacketTimeout
+	case s.packetWait < 0:
+		return 0
+	}
+	return s.packetWait
+}
 
 // PathOpsConcurrent asserts that the driver's read-only path calls (Stat,
 // ListDir, ReadFile, ReadLink) may run concurrently with each other and with

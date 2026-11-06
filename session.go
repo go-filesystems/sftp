@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/go-filesystems/inflight"
 	"github.com/go-filesystems/sftp/wire"
@@ -60,7 +61,12 @@ func (s *session) run() error {
 		if err != nil {
 			return err
 		}
+		// The slot and the token are held while the rest of the packet
+		// arrives, so that time is bounded: a client that sends a length and
+		// stops must not hold the server-wide budget.
+		stop := s.armPacketTimer()
 		typ, payload, next, err := wire.ReadPacket(br, sl.In, s.srv.packetLimit())
+		stop()
 		sl.In = next
 		if err != nil {
 			s.conn.Abandon(sl)
@@ -76,6 +82,28 @@ func (s *session) run() error {
 			// A barrier: everything before it is answered first.
 			s.conn.Barrier(sl, func(sl *inflight.Slot) ([]byte, error) { return frame(sl, s.dispatch(typ, payload)) })
 		}
+	}
+}
+
+// armPacketTimer starts the clock on the rest of a packet and returns what
+// stops it. When it runs out the stream is given up: through SetReadDeadline
+// if the stream has one (a net.Conn), by closing it otherwise (an SSH channel).
+// A stream with neither cannot be interrupted, and the bound does not hold.
+func (s *session) armPacketTimer() (stop func()) {
+	d := s.srv.packetTimeout()
+	if d <= 0 {
+		return func() {}
+	}
+	t := time.AfterFunc(d, s.giveUp)
+	return func() { t.Stop() }
+}
+
+func (s *session) giveUp() {
+	switch c := s.rw.(type) {
+	case interface{ SetReadDeadline(time.Time) error }:
+		c.SetReadDeadline(time.Unix(1, 0))
+	case io.Closer:
+		c.Close()
 	}
 }
 
