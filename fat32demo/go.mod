@@ -7,9 +7,9 @@ go 1.27.1
 replace github.com/go-filesystems/sftp => ../
 
 require (
-	github.com/go-filesystems/fat32 v0.10.0
+	github.com/go-filesystems/fat32 v0.11.0
 	github.com/go-filesystems/interface v0.5.0
-	github.com/go-filesystems/sftp v0.7.1
+	github.com/go-filesystems/sftp v0.10.1
 	golang.org/x/crypto v0.58.0
 )
 
