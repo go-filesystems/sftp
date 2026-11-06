@@ -206,7 +206,10 @@ requests may overlap and which byte range each touches.
   (sftp-server.c:2064-2066, 2121: no input is read while the output queue
   cannot take a maximum-size message), with knfsd's thread pool and Samba's
   `aio max threads` as the shared budget. A peer that never reads keeps its
-  tokens, as it would keep a knfsd thread: close stalled connections.
+  tokens, as it would keep a knfsd thread: close stalled connections. The rest
+  of a packet has `WithPacketTimeout` (30 s) to arrive once its first byte has,
+  since the request holds its slot and token meanwhile; a packet that is late
+  ends the session (the stream is closed, or given a past read deadline).
 
 ## The write path, measured
 
