@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"sync"
 
+	"github.com/go-filesystems/inflight"
 	"github.com/go-filesystems/sftp/wire"
 )
 
@@ -32,15 +32,7 @@ type session struct {
 	srv     *Server
 	rw      io.ReadWriter
 	handles *handles
-	slots   *slots
-	w       *replyWriter
-	wg      sync.WaitGroup // requests enqueued and not yet written
-
-	// queue holds the requests in flight in order of arrival; replies are
-	// written from its head. qmu guards it.
-	qmu      sync.Mutex
-	queue    []*slot
-	flushing bool // a goroutine is writing replies from the head of queue
+	conn    *inflight.Conn
 
 	// in and out serve negotiation; requests use their slot's buffers.
 	in, out []byte
@@ -54,9 +46,9 @@ func (s *session) run() error {
 	}
 	// Whatever ends the loop, requests in flight are answered (or fail on
 	// the dead stream) before run returns and the handles are closed.
-	defer s.wg.Wait()
+	defer s.conn.Wait()
 	for {
-		if err := s.w.failure(); err != nil {
+		if err := s.conn.Err(); err != nil {
 			return err
 		}
 		// Wait for the next packet to begin BEFORE taking a slot and a token:
@@ -64,31 +56,25 @@ func (s *session) run() error {
 		if _, err := br.Peek(1); err != nil {
 			return endOfInput(err)
 		}
-		sl := s.acquire()
-		typ, payload, next, err := wire.ReadPacket(br, sl.in, s.srv.packetLimit())
-		sl.in = next
+		sl, err := s.conn.Begin()
 		if err != nil {
-			s.release(sl)
+			return err
+		}
+		typ, payload, next, err := wire.ReadPacket(br, sl.In, s.srv.packetLimit())
+		sl.In = next
+		if err != nil {
+			s.conn.Abandon(sl)
 			return endOfInput(err)
 		}
 		j, early := s.prepare(typ, payload)
 		switch {
 		case j != nil:
-			s.srv.ranges.acquire(&j.span)
-			s.enqueue(sl)
-			if s.slots.max == 1 {
-				s.serveJob(sl, j)
-			} else {
-				go s.serveJob(sl, j)
-			}
+			s.conn.Go(sl, j.span, j.run)
 		case early != nil:
-			s.enqueue(sl)
-			s.complete(sl, early)
+			s.conn.Barrier(sl, func(sl *inflight.Slot) ([]byte, error) { return frame(sl, early) })
 		default:
 			// A barrier: everything before it is answered first.
-			s.wg.Wait()
-			s.enqueue(sl)
-			s.complete(sl, s.dispatch(typ, payload))
+			s.conn.Barrier(sl, func(sl *inflight.Slot) ([]byte, error) { return frame(sl, s.dispatch(typ, payload)) })
 		}
 	}
 }

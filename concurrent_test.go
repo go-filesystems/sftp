@@ -10,11 +10,13 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-filesystems/inflight"
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp/wire"
 )
@@ -334,30 +336,6 @@ func TestInFlightCapIsBackpressure(t *testing.T) {
 	c.finish()
 }
 
-// Memory stays bounded however many requests are queued: a flood of reads
-// creates no more slots than the cap.
-func TestSlotsNeverExceedCap(t *testing.T) {
-	p := newSlots(3)
-	var got []*slot
-	for range 3 {
-		got = append(got, p.acquire())
-	}
-	done := make(chan *slot)
-	go func() { done <- p.acquire() }()
-	select {
-	case <-done:
-		t.Fatal("a fourth slot was handed out")
-	case <-time.After(50 * time.Millisecond):
-	}
-	p.release(got[0])
-	if s := <-done; s != got[0] {
-		t.Fatal("the released slot was not reused")
-	}
-	if p.made != 3 {
-		t.Fatalf("made %d slots, want 3", p.made)
-	}
-}
-
 // The client vanishes with requests pending: Serve waits for them, then
 // releases every handle, and does not return an error for a clean EOF.
 func TestSessionEndsWithRequestsPending(t *testing.T) {
@@ -413,6 +391,50 @@ func TestReplyFailureEndsSession(t *testing.T) {
 	}
 }
 
+// failAfter lets n Writes through, then fails every one.
+type failAfter struct {
+	net.Conn
+	ok atomic.Int32
+}
+
+func (f *failAfter) Write(p []byte) (int, error) {
+	if f.ok.Add(-1) < 0 {
+		return 0, errBoom
+	}
+	return f.Conn.Write(p)
+}
+
+// A reply that fails to write while the session is idle (waiting for the next
+// packet, holding no slot) ends the session when that packet arrives, with the
+// write's error, and without reading it.
+func TestFailureWhileIdleEndsSessionAtTheNextPacket(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	fsys := newHookFS(make([]byte, 64), func(string, int64) {
+		once.Do(func() { close(entered) })
+		<-release
+	})
+	srv, _ := New(fsys, ReadWrite())
+	a, b := net.Pipe()
+	fw := &failAfter{Conn: b}
+	fw.ok.Store(2) // VERSION and the reply to OPEN
+	c := &client{t: t, conn: a, done: make(chan struct{})}
+	go func() { c.serveErr = srv.Serve(fw); close(c.done) }()
+	t.Cleanup(func() { a.Close() })
+	c.init()
+	h := c.open("/f", wire.FxfRead)
+	c.sendRead(1, h, 0, 8)
+	within(t, "read in the driver", entered)
+	close(release)
+	time.Sleep(100 * time.Millisecond) // the reply's write fails; the session is in Peek
+	c.sendRead(2, h, 0, 8)
+	within(t, "Serve returns", c.done)
+	if !errors.Is(c.serveErr, errBoom) {
+		t.Fatalf("Serve = %v, want the write error", c.serveErr)
+	}
+}
+
 // oneWrite lets exactly one Write through, then fails.
 type oneWrite struct {
 	w io.Writer
@@ -432,53 +454,6 @@ var errBoom = errors.New("boom")
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, errBoom }
-
-func TestReplyWriterRemembersFirstFailure(t *testing.T) {
-	rw := &replyWriter{w: failWriter{}}
-	if _, err := rw.Write([]byte("x")); !errors.Is(err, errBoom) {
-		t.Fatalf("first write: %v", err)
-	}
-	if _, err := rw.Write([]byte("y")); !errors.Is(err, errBoom) {
-		t.Fatalf("second write: %v", err)
-	}
-	rw.fail(errors.New("other"))
-	if !errors.Is(rw.failure(), errBoom) {
-		t.Fatalf("failure = %v, want the first", rw.failure())
-	}
-	fresh := &replyWriter{w: io.Discard}
-	fresh.fail(ErrVersion)
-	if fresh.failure() != ErrVersion {
-		t.Fatal("fail did not record")
-	}
-}
-
-func TestSaturatingAdd(t *testing.T) {
-	if satAdd(1, 2) != 3 || satAdd(math.MaxUint64, 1) != math.MaxUint64 || satAdd(math.MaxUint64-1, 1) != math.MaxUint64 {
-		t.Fatal("satAdd")
-	}
-}
-
-func TestSpanConflicts(t *testing.T) {
-	a := &span{path: "/f", lo: 0, hi: 10, write: true}
-	for _, tc := range []struct {
-		b    span
-		want bool
-	}{
-		{span{path: "/f", lo: 5, hi: 6}, true},
-		{span{path: "/f", lo: 10, hi: 20}, false},
-		{span{path: "/g", lo: 5, hi: 6}, false},
-		{span{path: "/f", lo: 5, hi: 6, write: true}, true},
-	} {
-		if got := a.conflicts(&tc.b); got != tc.want {
-			t.Errorf("%+v: %v", tc.b, got)
-		}
-	}
-	r1 := &span{path: "/f", lo: 0, hi: 10}
-	r2 := &span{path: "/f", lo: 0, hi: 10}
-	if r1.conflicts(r2) {
-		t.Fatal("two reads conflict")
-	}
-}
 
 // Offsets from the wire past what int64 holds are refused, not wrapped.
 func TestHugeOffsets(t *testing.T) {
@@ -638,11 +613,11 @@ func TestMaxInFlightOption(t *testing.T) {
 			t.Errorf("WithMaxInFlight(%d) = %d, want %d", tc.in, s.maxInFlight, tc.want)
 		}
 	}
-	if s, _ := New(newMemFS()); s.maxTotal != DefaultMaxInFlightTotal || cap(s.tokens) != DefaultMaxInFlightTotal {
+	if s, _ := New(newMemFS()); s.maxTotal != DefaultMaxInFlightTotal || s.pool == nil {
 		t.Errorf("default total = %d", s.maxTotal)
 	}
-	if s, _ := New(newMemFS(), WithMaxInFlightTotal(7)); cap(s.tokens) != 7 {
-		t.Errorf("WithMaxInFlightTotal(7): %d tokens", cap(s.tokens))
+	if s, _ := New(newMemFS(), WithMaxInFlightTotal(7)); s.maxTotal != 7 {
+		t.Errorf("WithMaxInFlightTotal(7): %d", s.maxTotal)
 	}
 	// 1 is the serial mode of v0.7.0 and still transfers.
 	m := newMemFS().addFile("/f", []byte("serial"), 0o100644)
@@ -736,43 +711,6 @@ type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errBoom }
 
-// A reply that completes while another goroutine is writing the head of the
-// queue is left to that goroutine, which writes it after the first, in order.
-func TestCompleteLeavesTheQueueToTheWriter(t *testing.T) {
-	srv, _ := New(newMemFS())
-	gate := make(chan struct{})
-	started := make(chan struct{})
-	var mu sync.Mutex
-	var written [][]byte
-	w := writerFunc(func(p []byte) (int, error) {
-		mu.Lock()
-		first := len(written) == 0
-		written = append(written, append([]byte(nil), p...))
-		mu.Unlock()
-		if first {
-			close(started)
-			<-gate
-		}
-		return len(p), nil
-	})
-	s := &session{srv: srv, slots: newSlots(2), w: &replyWriter{w: w}}
-	a, b := s.acquire(), s.acquire()
-	s.enqueue(a)
-	s.enqueue(b)
-	done := make(chan struct{})
-	go func() { s.complete(a, status(1, wire.StatusOK, "")); close(done) }()
-	within(t, "first write begins", started)
-	s.complete(b, status(2, wire.StatusOK, "")) // returns at once: a's writer takes it
-	close(gate)
-	within(t, "first writer finishes", done)
-	s.wg.Wait()
-	mu.Lock()
-	defer mu.Unlock()
-	if len(written) != 2 || requestID(written[0][5:]) != 1 || requestID(written[1][5:]) != 2 {
-		t.Fatalf("written %d replies, want ids 1 then 2", len(written))
-	}
-}
-
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
@@ -780,12 +718,22 @@ func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 // A reply too large to frame ends the session instead of being dropped
 // silently: the client would otherwise wait for it forever.
 func TestUnframableReplyFailsTheSession(t *testing.T) {
+	// frame hands the error to inflight, which ends the connection with it.
+	if _, err := frame(&inflight.Slot{}, wire.DataReply{ID: 1, Data: make([]byte, wire.MaxPacket)}); !errors.Is(err, wire.ErrPacketTooLarge) {
+		t.Fatalf("frame = %v, want ErrPacketTooLarge", err)
+	}
+}
+
+func TestSaturatingAdd(t *testing.T) {
+	if satAdd(1, 2) != 3 || satAdd(math.MaxUint64, 1) != math.MaxUint64 || satAdd(math.MaxUint64-1, 1) != math.MaxUint64 {
+		t.Fatal("satAdd")
+	}
+}
+
+// A nil stream cannot carry a session: Serve refuses it.
+func TestServeRefusesANilStream(t *testing.T) {
 	srv, _ := New(newMemFS())
-	s := &session{srv: srv, slots: newSlots(1), w: &replyWriter{w: io.Discard}}
-	sl := s.acquire()
-	s.enqueue(sl)
-	s.complete(sl, wire.DataReply{ID: 1, Data: make([]byte, wire.MaxPacket)})
-	if !errors.Is(s.w.failure(), wire.ErrPacketTooLarge) {
-		t.Fatalf("failure = %v, want ErrPacketTooLarge", s.w.failure())
+	if err := srv.Serve(nil); !errors.Is(err, inflight.ErrWriter) {
+		t.Fatalf("Serve(nil) = %v", err)
 	}
 }
