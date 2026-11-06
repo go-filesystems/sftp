@@ -3,9 +3,9 @@ package sftp
 import (
 	"errors"
 	"io"
-	"sync"
 	"time"
 
+	"github.com/go-filesystems/inflight"
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp/wire"
 )
@@ -41,57 +41,34 @@ type Server struct {
 
 	// maxInFlight is how many requests one session may have in progress.
 	maxInFlight int
-	// maxTotal is the server-wide cap, and tokens its budget: one token is
-	// held by every request from before its packet is read until its reply
-	// is written.
+	// maxTotal is the server-wide cap: one of pool's tokens is held by every
+	// request from before its packet is read until its reply is written.
 	maxTotal int
-	tokens   chan struct{}
 	// pathConcurrent is the embedder's assertion that the driver's
 	// read-only path calls (Stat, ListDir, ReadFile, ReadLink) are safe
 	// concurrently with each other and with File I/O. See [PathOpsConcurrent].
 	pathConcurrent bool
 
-	// fsmu is the filesystem lock, and the driver contract made executable.
-	//
-	// The interface module documents exactly two things as safe for
-	// concurrent use: File.ReadAt, and WritableFile.WriteAt on
-	// non-overlapping ranges (interface v0.5.0, File and WritableFile).
-	// It documents NOTHING about concurrent path-based calls (Stat, ListDir,
-	// WriteFile, ...), Truncate or Sync. So:
-	//
-	//   - File.ReadAt and File.WriteAt hold fsmu for READING: any number run
-	//     together, ranges permitting (see [rangeSet]).
-	//   - Every path-based call, Truncate, Sync and Close holds fsmu
-	//     exclusively, and so never overlaps any File I/O or any other path
-	//     call. This is v0.7.0's behaviour for them, unchanged.
-	//   - With [PathOpsConcurrent] the read-only path calls hold it for
-	//     reading as well.
-	fsmu sync.RWMutex
-	// ranges orders overlapping reads and writes across every session.
-	ranges rangeSet
+	// pool holds what every session shares: the server-wide cap and the byte
+	// ranges in progress, which order overlapping reads and writes across
+	// sessions. See [github.com/go-filesystems/inflight].
+	pool *inflight.Pool
+	// fs is the filesystem lock, and the driver contract made executable:
+	// File.ReadAt and File.WriteAt hold it shared (ranges permitting), every
+	// other driver call exclusively, the read-only path calls shared with
+	// [PathOpsConcurrent].
+	fs *inflight.FSLock
 }
 
 // lock takes the filesystem lock exclusively: for path-based mutations,
 // Truncate, Sync and Close.
-func (s *Server) lock()   { s.fsmu.Lock() }
-func (s *Server) unlock() { s.fsmu.Unlock() }
+func (s *Server) lock()   { s.fs.Lock() }
+func (s *Server) unlock() { s.fs.Unlock() }
 
 // rlock is for read-only path calls: shared only if the embedder asserted
 // [PathOpsConcurrent], exclusive otherwise.
-func (s *Server) rlock() {
-	if s.pathConcurrent {
-		s.fsmu.RLock()
-	} else {
-		s.fsmu.Lock()
-	}
-}
-func (s *Server) runlock() {
-	if s.pathConcurrent {
-		s.fsmu.RUnlock()
-	} else {
-		s.fsmu.Unlock()
-	}
-}
+func (s *Server) rlock()   { s.fs.LockPath() }
+func (s *Server) runlock() { s.fs.UnlockPath() }
 
 // DefaultMaxInFlight is how many requests a session may have in progress at
 // once unless [WithMaxInFlight] says otherwise: OpenSSH's sftp client keeps
@@ -178,7 +155,9 @@ func New(fsys filesystem.Filesystem, opts ...Option) (*Server, error) {
 	if s.maxTotal <= 0 {
 		s.maxTotal = DefaultMaxInFlightTotal
 	}
-	s.tokens = make(chan struct{}, s.maxTotal)
+	// maxTotal is positive here, so NewPool cannot refuse it.
+	s.pool, _ = inflight.NewPool(s.maxTotal)
+	s.fs = inflight.NewFSLock(s.pathConcurrent)
 	return s, nil
 }
 
@@ -202,13 +181,11 @@ func (s *Server) Serve(rw io.ReadWriter) error {
 	if n <= 0 {
 		n = DefaultMaxInFlight
 	}
-	sess := &session{
-		srv:     s,
-		rw:      rw,
-		handles: newHandles(),
-		slots:   newSlots(n),
-		w:       &replyWriter{w: rw},
+	conn, err := s.pool.NewConn(rw, inflight.InOrder, n)
+	if err != nil {
+		return err
 	}
+	sess := &session{srv: s, rw: rw, handles: newHandles(), conn: conn}
 	// run returns only after every request in flight has been answered, so
 	// closeAll never races a READ or WRITE still holding a driver file.
 	defer sess.handles.closeAll()

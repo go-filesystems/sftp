@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 
+	"github.com/go-filesystems/inflight"
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp/wire"
 )
@@ -540,17 +541,17 @@ func (s *session) readJob(m wire.ReadRequest) (*job, wire.Message) {
 	// send. A client asking for more gets a short read, which io.ReaderAt's
 	// contract and every SFTP client both handle.
 	n := min(int(m.Length), s.srv.readLength())
-	sp := span{path: h.path, lo: m.Offset, hi: satAdd(m.Offset, uint64(n))}
-	return &job{span: sp, run: func(sl *slot) wire.Message {
+	sp := inflight.ReadRange(h.path, m.Offset, uint64(n))
+	return &job{span: sp, run: func(sl *inflight.Slot) ([]byte, error) {
 		if h.file != nil {
 			// File.ReadAt is documented safe for concurrent use: shared.
-			s.srv.fsmu.RLock()
-			defer s.srv.fsmu.RUnlock()
-			return s.readAt(m.ID, h.file, m.Offset, n, sl)
+			s.srv.fs.LockIO()
+			defer s.srv.fs.UnlockIO()
+			return frame(sl, s.readAt(m.ID, h.file, m.Offset, n, sl))
 		}
 		s.srv.rlock()
 		defer s.srv.runlock()
-		return s.readWhole(m.ID, h.path, m.Offset, n)
+		return frame(sl, s.readWhole(m.ID, h.path, m.Offset, n))
 	}}, nil
 }
 
@@ -561,14 +562,14 @@ func (s *session) readJob(m wire.ReadRequest) (*job, wire.Message) {
 // File.Size is deliberately not consulted: ReadAt answers 0, io.EOF at or
 // past the end by contract, and Size of a writable file is not documented as
 // safe beside a concurrent WriteAt.
-func (s *session) readAt(id uint32, f filesystem.File, off uint64, n int, sl *slot) wire.Message {
+func (s *session) readAt(id uint32, f filesystem.File, off uint64, n int, sl *inflight.Slot) wire.Message {
 	if off > math.MaxInt64 {
 		return status(id, wire.StatusEOF, "")
 	}
-	if cap(sl.data) < n {
-		sl.data = make([]byte, n)
+	if cap(sl.Data) < n {
+		sl.Data = make([]byte, n)
 	}
-	buf := sl.data[:n]
+	buf := sl.Data[:n]
 	got, err := f.ReadAt(buf, int64(off))
 	if got > 0 {
 		// io.ReaderAt may return data together with io.EOF. Sending the
@@ -631,26 +632,26 @@ func (s *session) writeJob(m wire.WriteRequest) (*job, wire.Message) {
 	if m.Offset > math.MaxInt64 {
 		return nil, status(m.ID, wire.StatusFailure, "offset beyond what a file can hold")
 	}
-	sp := span{path: h.path, lo: m.Offset, hi: satAdd(m.Offset, uint64(len(m.Data))), write: true}
+	sp := inflight.WriteRange(h.path, m.Offset, uint64(len(m.Data)))
 	if h.writable == nil {
 		// No positional write: this is a rewrite of the whole file, so it
 		// orders against every other request on the path.
-		sp.lo, sp.hi = 0, math.MaxUint64
+		sp = inflight.WriteAll(h.path)
 	}
-	return &job{span: sp, run: func(*slot) wire.Message {
+	return &job{span: sp, run: func(sl *inflight.Slot) ([]byte, error) {
 		if h.writable != nil {
 			// WritableFile.WriteAt is documented safe for concurrent use on
 			// non-overlapping ranges, which the range set guarantees: shared.
-			s.srv.fsmu.RLock()
-			defer s.srv.fsmu.RUnlock()
+			s.srv.fs.LockIO()
+			defer s.srv.fs.UnlockIO()
 			if _, err := h.writable.WriteAt(m.Data, int64(m.Offset)); err != nil {
-				return status(m.ID, statusFor(err, wire.StatusFailure), errText(err))
+				return frame(sl, status(m.ID, statusFor(err, wire.StatusFailure), errText(err)))
 			}
-			return status(m.ID, wire.StatusOK, "")
+			return frame(sl, status(m.ID, wire.StatusOK, ""))
 		}
 		s.srv.lock()
 		defer s.srv.unlock()
-		return s.writeSplice(m.ID, h.path, m.Offset, m.Data)
+		return frame(sl, s.writeSplice(m.ID, h.path, m.Offset, m.Data))
 	}}, nil
 }
 

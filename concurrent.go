@@ -6,12 +6,17 @@ package sftp
 import (
 	"io"
 	"math"
-	"sync"
 
+	"github.com/go-filesystems/inflight"
 	"github.com/go-filesystems/sftp/wire"
 )
 
 // Concurrent dispatch.
+//
+// The mechanism (bounds, range ordering, barriers, reply order) lives in
+// [github.com/go-filesystems/inflight], extracted from this module's v0.9.0
+// and shared with the NFS and SMB servers. What stays here is what is SFTP:
+// which requests may overlap and what byte range each touches.
 //
 // Bibliography (opened 2026-11-05):
 //
@@ -42,97 +47,36 @@ import (
 // is stricter than §6.1 asks; it is also what makes handle-table and
 // directory-cursor state need no lock, and a transfer (OPEN, 64 READs,
 // CLOSE) loses nothing to it.
+//
+// Replies go out in the order the requests arrived (inflight.InOrder).
+//
+// Why in order: the draft allows any order (§6.1, §7), but OpenSSH's client
+// treats a reordered reply as a reason to refuse to resume: sftp-client.c
+// sets `reordered = 1` when a reply's offset is past the high-water mark
+// (line 1795) and then fails "get -a" / "reget" with "server reordered
+// requests" (lines 1856-1859); OpenSSH's own server never reorders
+// (sftp-server.c process() runs one handler per call). So the work is
+// concurrent and the replies are sequential.
+//
+// A slot, and the global token with it, is freed when its reply is written,
+// so a peer that does not read keeps its requests' memory counted: the
+// analogue of OpenSSH's sftp-server not reading input while its output queue
+// cannot take a maximum-size message (sftp-server.c lines 2064-2066 and 2121).
 
-// replyWriter serialises replies from concurrent requests onto one stream:
-// each reply is one Write (wire.WritePacket's guarantee), so holding the
-// mutex around a Write keeps packets whole. A failed Write is remembered, and
-// the session ends at its next packet.
-type replyWriter struct {
-	wmu sync.Mutex // held across a Write, which may block on a slow peer
-	w   io.Writer
-
-	emu sync.Mutex // guards err only, so failure() never waits on a Write
-	err error
+// job is a request that may run beside others: where it touches, and how to
+// answer it.
+type job struct {
+	span inflight.Span
+	run  inflight.Run
 }
 
-func (r *replyWriter) Write(p []byte) (int, error) {
-	r.wmu.Lock()
-	defer r.wmu.Unlock()
-	if err := r.failure(); err != nil {
-		return 0, err
-	}
-	n, err := r.w.Write(p)
-	if err != nil {
-		r.fail(err)
-	}
-	return n, err
-}
-
-// fail records why the session cannot go on (a write error, or a reply too
-// large to frame), keeping the first.
-func (r *replyWriter) fail(err error) {
-	r.emu.Lock()
-	defer r.emu.Unlock()
-	if r.err == nil {
-		r.err = err
-	}
-}
-
-func (r *replyWriter) failure() error {
-	r.emu.Lock()
-	defer r.emu.Unlock()
-	return r.err
-}
-
-// slot is one request's buffers. A session owns at most maxInFlight of them,
-// created on demand and reused for the life of the session, so a bulk
-// transfer allocates nothing per packet in steady state.
-type slot struct {
-	in, out, data []byte
-	// sp is the byte range the request holds in the server's range set, nil
-	// for a request that holds none; done is set when the reply is framed in
-	// out and waits only for its turn to be written.
-	sp   *span
-	done bool
-}
-
-// slots is a session's pool of slots, and its cap on requests in flight.
-type slots struct {
-	free chan *slot
-	made int
-	max  int
-}
-
-func newSlots(n int) *slots { return &slots{free: make(chan *slot, n), max: n} }
-
-// acquire returns a slot, blocking while all of them are in use. It is called
-// BEFORE a packet is read, so at the cap the session stops reading and the
-// client waits in the transport; nothing has been allocated for the request
-// that is refused a slot. Only the session's reader calls it.
-func (p *slots) acquire() *slot {
-	select {
-	case sl := <-p.free:
-		return sl
-	default:
-	}
-	if p.made < p.max {
-		p.made++
-		return &slot{}
-	}
-	return <-p.free
-}
-
-func (p *slots) release(sl *slot) { p.free <- sl }
-
-// span is the part of a file one request touches.
-type span struct {
-	path   string
-	lo, hi uint64 // [lo, hi)
-	write  bool
-}
-
-func (a *span) conflicts(b *span) bool {
-	return a.path == b.path && (a.write || b.write) && a.lo < b.hi && b.lo < a.hi
+// frame frames m as the reply in the slot's output buffer; nothing is written
+// here (io.Discard). A reply too large to frame is an error that ends the
+// session.
+func frame(sl *inflight.Slot, m wire.Message) ([]byte, error) {
+	var err error
+	sl.Out, err = wire.Send(io.Discard, m, sl.Out)
+	return sl.Out, err
 }
 
 // satAdd is a+b, saturating: the offset comes off the wire.
@@ -141,58 +85,6 @@ func satAdd(a, b uint64) uint64 {
 		return math.MaxUint64
 	}
 	return a + b
-}
-
-// rangeSet is the set of spans being processed, across every session of a
-// Server, and what makes overlapping I/O wait its turn. Two sessions writing
-// one file overlap exactly as two requests of one session do.
-type rangeSet struct {
-	mu     sync.Mutex
-	cv     *sync.Cond
-	active []*span
-}
-
-// acquire blocks until sp conflicts with nothing in progress, then registers
-// it. Callers are the sessions' readers, one packet at a time, which keeps a
-// session's own requests in arrival order.
-func (r *rangeSet) acquire(sp *span) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.cv == nil {
-		r.cv = sync.NewCond(&r.mu)
-	}
-	for r.blocked(sp) {
-		r.cv.Wait()
-	}
-	r.active = append(r.active, sp)
-}
-
-func (r *rangeSet) blocked(sp *span) bool {
-	for _, a := range r.active {
-		if sp.conflicts(a) {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *rangeSet) release(sp *span) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i, a := range r.active {
-		if a == sp {
-			r.active = append(r.active[:i], r.active[i+1:]...)
-			break
-		}
-	}
-	r.cv.Broadcast()
-}
-
-// job is a request that may run beside others: where it touches, and how to
-// answer it.
-type job struct {
-	span span
-	run  func(*slot) wire.Message
 }
 
 // prepare decodes a READ or WRITE and checks everything that needs no driver.
@@ -214,80 +106,4 @@ func (s *session) prepare(typ uint8, payload []byte) (*job, wire.Message) {
 		return s.writeJob(m)
 	}
 	return nil, nil
-}
-
-// serveJob runs j and completes its request.
-func (s *session) serveJob(sl *slot, j *job) {
-	sl.sp = &j.span
-	s.complete(sl, j.run(sl))
-}
-
-// enqueue puts a request in the session's order of arrival. Replies leave in
-// that order, whatever order the requests finish in.
-//
-// Why in order: the draft allows any order (§6.1, §7), but OpenSSH's client
-// treats a reordered reply as a reason to refuse to resume: sftp-client.c
-// sets `reordered = 1` when a reply's offset is past the high-water mark
-// (line 1795) and then fails "get -a" / "reget" with "server reordered
-// requests" (lines 1856-1859); OpenSSH's own server never reorders
-// (sftp-server.c process() runs one handler per call). So the work is
-// concurrent and the replies are sequential.
-func (s *session) enqueue(sl *slot) {
-	sl.sp, sl.done = nil, false
-	s.wg.Add(1)
-	s.qmu.Lock()
-	s.queue = append(s.queue, sl)
-	s.qmu.Unlock()
-}
-
-// complete frames m as sl's reply, lets go of its byte range at once (a later
-// overlapping request need not wait for the reply to be written), and writes
-// every reply that is now at the head of the queue. A slot, and the global
-// token with it, is freed when its reply is written, so a peer that does not
-// read keeps its requests' memory counted: the analogue of OpenSSH's
-// sftp-server not reading input while its output queue cannot take a
-// maximum-size message (sftp-server.c lines 2064-2066 and 2121).
-func (s *session) complete(sl *slot, m wire.Message) {
-	var err error
-	// Framed into sl.out; nothing is written here (io.Discard).
-	if sl.out, err = wire.Send(io.Discard, m, sl.out); err != nil {
-		s.w.fail(err)
-	}
-	if sl.sp != nil {
-		s.srv.ranges.release(sl.sp)
-	}
-	s.qmu.Lock()
-	sl.done = true
-	if s.flushing {
-		// Another goroutine is writing replies and will reach this one.
-		s.qmu.Unlock()
-		return
-	}
-	s.flushing = true
-	for len(s.queue) > 0 && s.queue[0].done {
-		h := s.queue[0]
-		s.queue = s.queue[1:]
-		// The write may block on a peer that is slow to read; the lock is
-		// not held across it, so the session still reads and enqueues.
-		s.qmu.Unlock()
-		s.w.Write(h.out)
-		s.release(h)
-		s.wg.Done()
-		s.qmu.Lock()
-	}
-	s.flushing = false
-	s.qmu.Unlock()
-}
-
-// acquire takes a slot of this session, then a token of the server's global
-// budget (WithMaxInFlightTotal); both before a packet is read.
-func (s *session) acquire() *slot {
-	sl := s.slots.acquire()
-	s.srv.tokens <- struct{}{}
-	return sl
-}
-
-func (s *session) release(sl *slot) {
-	<-s.srv.tokens
-	s.slots.release(sl)
 }

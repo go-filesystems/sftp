@@ -175,6 +175,12 @@ reordered reply as a reason to refuse `get -a`/`reget` ("server reordered
 requests", sftp-client.c:1795 and 1856), and OpenSSH's own server never
 reorders (sftp-server.c `process()`).
 
+The mechanism (bounds, range ordering, barriers, reply order, the filesystem
+lock) is the shared module
+[go-filesystems/inflight](https://github.com/go-filesystems/inflight), also
+used by the NFS and SMB servers; this module keeps what is SFTP: which
+requests may overlap and which byte range each touches.
+
 - **Parallel:** `READ` and `WRITE`, through the driver's `File.ReadAt` and
   `WritableFile.WriteAt`, which the interface module documents as safe for
   concurrent use (writes on non-overlapping ranges only).
