@@ -109,48 +109,57 @@ func notWithin(t *testing.T, what string, ch <-chan struct{}) {
 	}
 }
 
-// The first read is held inside the driver until the second has entered it:
-// both are in the driver at once, and the replies leave in the other order,
-// each carrying its own id and its own bytes (draft-ietf-secsh-filexfer-02
-// §6.1: no restriction on the order of responses).
-func TestReadsRunTogetherAndReplyOutOfOrder(t *testing.T) {
+// The first read is held inside the driver and the second runs beside it, to
+// completion; the replies still leave in the order the requests arrived. The
+// draft would allow either (§6.1, §7), but OpenSSH's client refuses to resume
+// a download whose replies came back reordered (sftp-client.c:1795, 1856).
+func TestReadsRunTogetherAndReplyInOrder(t *testing.T) {
 	data := bytes.Repeat([]byte("0123456789"), 20)
-	// The first read stays in the driver until its successor has been
-	// answered, so the order of the replies is not a race.
 	release := make(chan struct{})
+	secondIn := make(chan struct{})
 	fsys := newHookFS(data, func(op string, off int64) {
 		if off == 0 {
 			<-release
+		} else {
+			close(secondIn)
 		}
 	})
 	c := dial(t, fsys, ReadWrite())
 	h := c.open("/f", wire.FxfRead)
 	c.sendRead(100, h, 0, 10)
 	c.sendRead(101, h, 50, 10)
-	typ, p := c.recv()
-	if typ != wire.FxpData || replyID(t, p) != 101 {
-		t.Fatalf("first reply = type %d id %d, want DATA for 101", typ, replyID(t, p))
-	}
-	if d, _ := wire.DecodeData(p); !bytes.Equal(d.Data, data[50:60]) {
-		t.Fatalf("reply 101 = %q", d.Data)
-	}
+	within(t, "second read in the driver beside the first", secondIn)
+	got := make(chan struct{})
+	var typ uint8
+	var p []byte
+	go func() { typ, p = c.recv(); close(got) }()
+	notWithin(t, "a reply before the first request's", got)
 	close(release)
-	typ, p = c.recv()
+	within(t, "first reply", got)
 	if typ != wire.FxpData || replyID(t, p) != 100 {
-		t.Fatalf("second reply = type %d id %d, want DATA for 100", typ, replyID(t, p))
+		t.Fatalf("first reply = type %d id %d, want DATA for 100", typ, replyID(t, p))
 	}
 	if d, _ := wire.DecodeData(p); !bytes.Equal(d.Data, data[:10]) {
 		t.Fatalf("reply 100 = %q", d.Data)
+	}
+	typ, p = c.recv()
+	if typ != wire.FxpData || replyID(t, p) != 101 {
+		t.Fatalf("second reply = type %d id %d, want DATA for 101", typ, replyID(t, p))
+	}
+	if d, _ := wire.DecodeData(p); !bytes.Equal(d.Data, data[50:60]) {
+		t.Fatalf("reply 101 = %q", d.Data)
 	}
 	c.finish()
 }
 
 // A READ that overlaps a WRITE in progress waits for it; one that does not
-// overlap goes ahead of a write that is held.
+// overlap runs beside a write that is held (its reply still follows the
+// write's).
 func TestOverlapWaitsDisjointDoesNot(t *testing.T) {
 	enteredWrite := make(chan struct{})
 	releaseWrite := make(chan struct{})
 	readEntered := make(chan struct{})
+	disjointIn := make(chan struct{})
 	var wOnce, rOnce sync.Once
 	fsys := newHookFS(make([]byte, 400), func(op string, off int64) {
 		switch {
@@ -159,6 +168,8 @@ func TestOverlapWaitsDisjointDoesNot(t *testing.T) {
 			<-releaseWrite
 		case op == "read" && off == 5:
 			rOnce.Do(func() { close(readEntered) })
+		case op == "read" && off == 200:
+			close(disjointIn)
 		}
 	})
 	c := dial(t, fsys, ReadWrite())
@@ -166,11 +177,9 @@ func TestOverlapWaitsDisjointDoesNot(t *testing.T) {
 	c.sendWrite(1, h, 0, []byte("ABCDEFGHIJ"))
 	within(t, "write enters the driver", enteredWrite)
 
-	// Disjoint: a read at 200 is answered while the write is held.
+	// Disjoint: a read at 200 reaches the driver while the write is held.
 	c.sendRead(2, h, 200, 10)
-	if typ, p := c.recv(); typ != wire.FxpData || replyID(t, p) != 2 {
-		t.Fatalf("disjoint read: type %d id %d", typ, replyID(t, p))
-	}
+	within(t, "disjoint read in the driver beside the write", disjointIn)
 
 	// Overlapping: the read at 5 must not reach the driver yet. The client
 	// send blocks on the synchronous pipe once the server stops reading, so
@@ -183,6 +192,9 @@ func TestOverlapWaitsDisjointDoesNot(t *testing.T) {
 	typ, p := c.recv()
 	if typ != wire.FxpStatus || replyID(t, p) != 1 {
 		t.Fatalf("first completion: type %d id %d, want status for 1", typ, replyID(t, p))
+	}
+	if typ, p = c.recv(); typ != wire.FxpData || replyID(t, p) != 2 {
+		t.Fatalf("disjoint read: type %d id %d, want data for 2", typ, replyID(t, p))
 	}
 	typ, p = c.recv()
 	if typ != wire.FxpData || replyID(t, p) != 3 {
@@ -296,7 +308,13 @@ func TestInFlightCapIsBackpressure(t *testing.T) {
 	<-entered
 	third := make(chan struct{})
 	go func() { c.sendRead(3, h, 2, 1); close(third) }()
-	notWithin(t, "third request being read at the cap", third)
+	// The bytes may sit in the session's read buffer (64 KiB at most), but
+	// no request is begun: none reaches the driver while two are in flight.
+	select {
+	case <-entered:
+		t.Fatal("a third request reached the driver at a cap of 2")
+	case <-time.After(150 * time.Millisecond):
+	}
 	// The pipe has no buffer, so replies must be read for slots to free.
 	replies := make(chan struct{})
 	go func() {
@@ -620,6 +638,12 @@ func TestMaxInFlightOption(t *testing.T) {
 			t.Errorf("WithMaxInFlight(%d) = %d, want %d", tc.in, s.maxInFlight, tc.want)
 		}
 	}
+	if s, _ := New(newMemFS()); s.maxTotal != DefaultMaxInFlightTotal || cap(s.tokens) != DefaultMaxInFlightTotal {
+		t.Errorf("default total = %d", s.maxTotal)
+	}
+	if s, _ := New(newMemFS(), WithMaxInFlightTotal(7)); cap(s.tokens) != 7 {
+		t.Errorf("WithMaxInFlightTotal(7): %d tokens", cap(s.tokens))
+	}
 	// 1 is the serial mode of v0.7.0 and still transfers.
 	m := newMemFS().addFile("/f", []byte("serial"), 0o100644)
 	c := dial(t, openerFS{m}, WithMaxInFlight(1))
@@ -628,4 +652,140 @@ func TestMaxInFlightOption(t *testing.T) {
 		t.Fatalf("serial read = %q", got)
 	}
 	c.finish()
+}
+
+// Sessions together stay under the server-wide bound: three sessions that
+// could each have 64 requests in flight, a total of 4, and never more than 4
+// requests reach the driver, however the sessions interleave.
+func TestServerWideCapBoundsAllSessions(t *testing.T) {
+	const total, sessions, perSession = 4, 3, 6
+	release := make(chan struct{})
+	entered := make(chan struct{}, 64)
+	var cur, peak atomic.Int32
+	fsys := newHookFS(make([]byte, 100), func(string, int64) {
+		n := cur.Add(1)
+		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+		}
+		entered <- struct{}{}
+		<-release
+		cur.Add(-1)
+	})
+	srv, err := New(fsys, ReadWrite(), WithMaxInFlightTotal(total))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every session is open before any request is made: an open needs a token
+	// too, and the first session's reads would hold them all.
+	type conn struct {
+		c *client
+		h string
+	}
+	var conns []conn
+	for range sessions {
+		c := serveOn(t, srv)
+		conns = append(conns, conn{c, c.open("/f", wire.FxfRead)})
+	}
+	var wg sync.WaitGroup
+	for _, cn := range conns {
+		c, h := cn.c, cn.h
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := range perSession {
+				c.sendRead(uint32(100+i), h, uint64(i), 1)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := range perSession {
+				if typ, p := c.recv(); typ != wire.FxpData || replyID(t, p) != uint32(100+i) {
+					t.Errorf("reply %d: type %d id %d", i, typ, replyID(t, p))
+				}
+			}
+		}()
+	}
+	for range total {
+		<-entered
+	}
+	time.Sleep(150 * time.Millisecond)
+	if n := cur.Load(); n != total {
+		t.Fatalf("%d requests in the driver, want exactly the global bound %d", n, total)
+	}
+	close(release)
+	wg.Wait()
+	if p := peak.Load(); p != total {
+		t.Fatalf("peak in the driver = %d, want %d", p, total)
+	}
+}
+
+// A read error between packets ends the session with that error.
+func TestInputErrorBetweenPackets(t *testing.T) {
+	srv, _ := New(newMemFS())
+	var in bytes.Buffer
+	wire.Send(&in, wire.InitRequest{Version: wire.Version}, nil)
+	err := srv.Serve(struct {
+		io.Reader
+		io.Writer
+	}{io.MultiReader(&in, errReader{}), io.Discard})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Serve = %v, want the read error", err)
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errBoom }
+
+// A reply that completes while another goroutine is writing the head of the
+// queue is left to that goroutine, which writes it after the first, in order.
+func TestCompleteLeavesTheQueueToTheWriter(t *testing.T) {
+	srv, _ := New(newMemFS())
+	gate := make(chan struct{})
+	started := make(chan struct{})
+	var mu sync.Mutex
+	var written [][]byte
+	w := writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		first := len(written) == 0
+		written = append(written, append([]byte(nil), p...))
+		mu.Unlock()
+		if first {
+			close(started)
+			<-gate
+		}
+		return len(p), nil
+	})
+	s := &session{srv: srv, slots: newSlots(2), w: &replyWriter{w: w}}
+	a, b := s.acquire(), s.acquire()
+	s.enqueue(a)
+	s.enqueue(b)
+	done := make(chan struct{})
+	go func() { s.complete(a, status(1, wire.StatusOK, "")); close(done) }()
+	within(t, "first write begins", started)
+	s.complete(b, status(2, wire.StatusOK, "")) // returns at once: a's writer takes it
+	close(gate)
+	within(t, "first writer finishes", done)
+	s.wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(written) != 2 || requestID(written[0][5:]) != 1 || requestID(written[1][5:]) != 2 {
+		t.Fatalf("written %d replies, want ids 1 then 2", len(written))
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// A reply too large to frame ends the session instead of being dropped
+// silently: the client would otherwise wait for it forever.
+func TestUnframableReplyFailsTheSession(t *testing.T) {
+	srv, _ := New(newMemFS())
+	s := &session{srv: srv, slots: newSlots(1), w: &replyWriter{w: io.Discard}}
+	sl := s.acquire()
+	s.enqueue(sl)
+	s.complete(sl, wire.DataReply{ID: 1, Data: make([]byte, wire.MaxPacket)})
+	if !errors.Is(s.w.failure(), wire.ErrPacketTooLarge) {
+		t.Fatalf("failure = %v, want ErrPacketTooLarge", s.w.failure())
+	}
 }

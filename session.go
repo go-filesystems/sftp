@@ -26,14 +26,21 @@ var ErrVersion = errors.New("sftp: unsupported client protocol version")
 // One goroutine reads packets; READ and WRITE are answered on goroutines of
 // their own, up to [WithMaxInFlight] at a time, and every other request is a
 // barrier run alone. See concurrent.go for the rules and their sources.
-// Replies go out as they complete, matched by request id.
+// Replies go out in the order the requests arrived, whatever order the work
+// finishes in (see [session.enqueue] for why).
 type session struct {
 	srv     *Server
 	rw      io.ReadWriter
 	handles *handles
 	slots   *slots
 	w       *replyWriter
-	wg      sync.WaitGroup
+	wg      sync.WaitGroup // requests enqueued and not yet written
+
+	// queue holds the requests in flight in order of arrival; replies are
+	// written from its head. qmu guards it.
+	qmu      sync.Mutex
+	queue    []*slot
+	flushing bool // a goroutine is writing replies from the head of queue
 
 	// in and out serve negotiation; requests use their slot's buffers.
 	in, out []byte
@@ -52,37 +59,48 @@ func (s *session) run() error {
 		if err := s.w.failure(); err != nil {
 			return err
 		}
-		sl := s.slots.acquire()
+		// Wait for the next packet to begin BEFORE taking a slot and a token:
+		// an idle session must hold nothing of the server-wide budget.
+		if _, err := br.Peek(1); err != nil {
+			return endOfInput(err)
+		}
+		sl := s.acquire()
 		typ, payload, next, err := wire.ReadPacket(br, sl.in, s.srv.packetLimit())
 		sl.in = next
 		if err != nil {
-			s.slots.release(sl)
-			// A clean end of stream at a packet boundary is how a client
-			// says goodbye; it is not a failure of anything.
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
+			s.release(sl)
+			return endOfInput(err)
 		}
 		j, early := s.prepare(typ, payload)
 		switch {
 		case j != nil:
 			s.srv.ranges.acquire(&j.span)
-			s.wg.Add(1)
+			s.enqueue(sl)
 			if s.slots.max == 1 {
 				s.serveJob(sl, j)
 			} else {
 				go s.serveJob(sl, j)
 			}
 		case early != nil:
-			s.reply(sl, early)
-			s.slots.release(sl)
+			s.enqueue(sl)
+			s.complete(sl, early)
 		default:
+			// A barrier: everything before it is answered first.
 			s.wg.Wait()
-			s.reply(sl, s.dispatch(typ, payload))
-			s.slots.release(sl)
+			s.enqueue(sl)
+			s.complete(sl, s.dispatch(typ, payload))
 		}
 	}
+}
+
+// endOfInput is what a failed read ends a session with. A clean end of stream
+// at a packet boundary is how a client says goodbye; it is not a failure of
+// anything.
+func endOfInput(err error) error {
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 // negotiate exchanges INIT and VERSION.

@@ -168,8 +168,12 @@ Two, both answered, and nothing advertised that is not:
 
 A session answers up to 64 requests at once (`sftp.WithMaxInFlight(n)`; 1 is
 the one-at-a-time behaviour of v0.7.0), which is what a client that pipelines
-64 `READ`s, as OpenSSH's `sftp` does, needs. Replies leave as they complete,
-matched by request id (draft-ietf-secsh-filexfer-02 §6.1, §7).
+64 `READ`s, as OpenSSH's `sftp` does, needs. The work is concurrent; the
+**replies leave in the order the requests arrived**. The draft would allow any
+order (draft-ietf-secsh-filexfer-02 §6.1, §7), but OpenSSH's client treats a
+reordered reply as a reason to refuse `get -a`/`reget` ("server reordered
+requests", sftp-client.c:1795 and 1856), and OpenSSH's own server never
+reorders (sftp-server.c `process()`).
 
 - **Parallel:** `READ` and `WRITE`, through the driver's `File.ReadAt` and
   `WritableFile.WriteAt`, which the interface module documents as safe for
@@ -186,9 +190,17 @@ matched by request id (draft-ietf-secsh-filexfer-02 §6.1, §7).
   the filesystem lock exclusively, as before; `ReadAt`/`WriteAt` hold it
   shared. A host-directory embedder whose `Stat`, `ListDir`, `ReadFile` and
   `ReadLink` are safe in parallel can say so with `sftp.PathOpsConcurrent()`.
-- **Bounded:** the cap is taken before a packet is read, so a client that
-  pipelines faster than the server answers waits in the transport; memory is
-  at most `n` packets in and `n` replies out per session.
+- **Bounded, per session and server-wide:** a slot (`WithMaxInFlight`, 64) and
+  a token of the server's budget (`WithMaxInFlightTotal`, 256 across ALL
+  sessions) are taken before a packet is read and freed when its reply is
+  written, so a client that pipelines faster than the server answers, or does
+  not read its replies, waits in the transport. Memory is at most 3 x total x
+  the packet limit (about 200 MiB at the defaults), however many sessions
+  there are. An idle session holds nothing. This is OpenSSH's own rule
+  (sftp-server.c:2064-2066, 2121: no input is read while the output queue
+  cannot take a maximum-size message), with knfsd's thread pool and Samba's
+  `aio max threads` as the shared budget. A peer that never reads keeps its
+  tokens, as it would keep a knfsd thread: close stalled connections.
 
 ## The write path, measured
 

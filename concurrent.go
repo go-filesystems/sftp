@@ -89,6 +89,11 @@ func (r *replyWriter) failure() error {
 // transfer allocates nothing per packet in steady state.
 type slot struct {
 	in, out, data []byte
+	// sp is the byte range the request holds in the server's range set, nil
+	// for a request that holds none; done is set when the reply is framed in
+	// out and waits only for its turn to be written.
+	sp   *span
+	done bool
 }
 
 // slots is a session's pool of slots, and its cap on requests in flight.
@@ -211,18 +216,78 @@ func (s *session) prepare(typ uint8, payload []byte) (*job, wire.Message) {
 	return nil, nil
 }
 
-// serveJob runs j and answers it; then frees everything it held.
+// serveJob runs j and completes its request.
 func (s *session) serveJob(sl *slot, j *job) {
-	s.reply(sl, j.run(sl))
-	s.srv.ranges.release(&j.span)
-	s.slots.release(sl)
-	s.wg.Done()
+	sl.sp = &j.span
+	s.complete(sl, j.run(sl))
 }
 
-// reply sends m on the shared stream, framed in sl's buffer.
-func (s *session) reply(sl *slot, m wire.Message) {
+// enqueue puts a request in the session's order of arrival. Replies leave in
+// that order, whatever order the requests finish in.
+//
+// Why in order: the draft allows any order (§6.1, §7), but OpenSSH's client
+// treats a reordered reply as a reason to refuse to resume: sftp-client.c
+// sets `reordered = 1` when a reply's offset is past the high-water mark
+// (line 1795) and then fails "get -a" / "reget" with "server reordered
+// requests" (lines 1856-1859); OpenSSH's own server never reorders
+// (sftp-server.c process() runs one handler per call). So the work is
+// concurrent and the replies are sequential.
+func (s *session) enqueue(sl *slot) {
+	sl.sp, sl.done = nil, false
+	s.wg.Add(1)
+	s.qmu.Lock()
+	s.queue = append(s.queue, sl)
+	s.qmu.Unlock()
+}
+
+// complete frames m as sl's reply, lets go of its byte range at once (a later
+// overlapping request need not wait for the reply to be written), and writes
+// every reply that is now at the head of the queue. A slot, and the global
+// token with it, is freed when its reply is written, so a peer that does not
+// read keeps its requests' memory counted: the analogue of OpenSSH's
+// sftp-server not reading input while its output queue cannot take a
+// maximum-size message (sftp-server.c lines 2064-2066 and 2121).
+func (s *session) complete(sl *slot, m wire.Message) {
 	var err error
-	if sl.out, err = wire.Send(s.w, m, sl.out); err != nil {
+	// Framed into sl.out; nothing is written here (io.Discard).
+	if sl.out, err = wire.Send(io.Discard, m, sl.out); err != nil {
 		s.w.fail(err)
 	}
+	if sl.sp != nil {
+		s.srv.ranges.release(sl.sp)
+	}
+	s.qmu.Lock()
+	sl.done = true
+	if s.flushing {
+		// Another goroutine is writing replies and will reach this one.
+		s.qmu.Unlock()
+		return
+	}
+	s.flushing = true
+	for len(s.queue) > 0 && s.queue[0].done {
+		h := s.queue[0]
+		s.queue = s.queue[1:]
+		// The write may block on a peer that is slow to read; the lock is
+		// not held across it, so the session still reads and enqueues.
+		s.qmu.Unlock()
+		s.w.Write(h.out)
+		s.release(h)
+		s.wg.Done()
+		s.qmu.Lock()
+	}
+	s.flushing = false
+	s.qmu.Unlock()
+}
+
+// acquire takes a slot of this session, then a token of the server's global
+// budget (WithMaxInFlightTotal); both before a packet is read.
+func (s *session) acquire() *slot {
+	sl := s.slots.acquire()
+	s.srv.tokens <- struct{}{}
+	return sl
+}
+
+func (s *session) release(sl *slot) {
+	<-s.srv.tokens
+	s.slots.release(sl)
 }

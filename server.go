@@ -41,6 +41,11 @@ type Server struct {
 
 	// maxInFlight is how many requests one session may have in progress.
 	maxInFlight int
+	// maxTotal is the server-wide cap, and tokens its budget: one token is
+	// held by every request from before its packet is read until its reply
+	// is written.
+	maxTotal int
+	tokens   chan struct{}
 	// pathConcurrent is the embedder's assertion that the driver's
 	// read-only path calls (Stat, ListDir, ReadFile, ReadLink) are safe
 	// concurrently with each other and with File I/O. See [PathOpsConcurrent].
@@ -108,6 +113,24 @@ func WithMaxInFlight(n int) Option {
 	return func(s *Server) { s.maxInFlight = min(n, MaxInFlightLimit) }
 }
 
+// DefaultMaxInFlightTotal is the server-wide ceiling on requests in flight
+// across every session unless [WithMaxInFlightTotal] says otherwise.
+const DefaultMaxInFlightTotal = 256
+
+// WithMaxInFlightTotal bounds the requests in flight across ALL sessions of
+// the server, the figure a host serving many clients sizes memory by: each
+// request in flight holds up to one packet in, one reply out and one read
+// buffer, so memory is at most 3 x n x the packet limit (about 200 MiB at the
+// defaults), however many sessions there are. A session that would exceed it
+// stops reading its input until another request is answered, as OpenSSH's
+// sftp-server stops reading while its output queue cannot take a
+// maximum-size message (sftp-server.c, process_requests). A peer that does
+// not read its replies keeps its tokens: the same is true of knfsd's threads
+// and Samba's `aio max threads`, and the answer there is the same, to close
+// idle or stalled connections. A non-positive value means
+// [DefaultMaxInFlightTotal].
+func WithMaxInFlightTotal(n int) Option { return func(s *Server) { s.maxTotal = n } }
+
 // PathOpsConcurrent asserts that the driver's read-only path calls (Stat,
 // ListDir, ReadFile, ReadLink) may run concurrently with each other and with
 // File I/O, which lets the server run them in parallel. The interface module
@@ -152,6 +175,10 @@ func New(fsys filesystem.Filesystem, opts ...Option) (*Server, error) {
 	for _, o := range opts {
 		o(s)
 	}
+	if s.maxTotal <= 0 {
+		s.maxTotal = DefaultMaxInFlightTotal
+	}
+	s.tokens = make(chan struct{}, s.maxTotal)
 	return s, nil
 }
 
