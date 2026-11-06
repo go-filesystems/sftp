@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp"
@@ -28,6 +29,9 @@ import (
 type ramFS struct {
 	mu    sync.RWMutex
 	files map[string][]byte
+	// slow makes every third 32 KiB block of a read slow, so that a server
+	// answering as work completes would send replies out of order.
+	slow time.Duration
 }
 
 func (r *ramFS) Close() error { return nil }
@@ -94,6 +98,9 @@ func (f *ramFile) Size() int64 {
 }
 func (f *ramFile) Close() error { return nil }
 func (f *ramFile) ReadAt(p []byte, off int64) (int, error) {
+	if f.r.slow > 0 && (off>>15)%3 == 0 {
+		time.Sleep(f.r.slow)
+	}
 	f.r.mu.RLock()
 	defer f.r.mu.RUnlock()
 	b := f.r.files[f.p]
@@ -107,6 +114,9 @@ func (f *ramFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 func (f *ramFile) WriteAt(p []byte, off int64) (int, error) {
+	if f.r.slow > 0 && (off>>15)%3 == 0 {
+		time.Sleep(f.r.slow)
+	}
 	f.r.mu.Lock()
 	defer f.r.mu.Unlock()
 	b := f.r.files[f.p]
@@ -206,7 +216,7 @@ func TestOpenSSHResumeAgainstConcurrentServer(t *testing.T) {
 	const size = 16<<20 + 321
 	src := make([]byte, size)
 	rand.Read(src)
-	srv, err := sftp.New(&ramFS{files: map[string][]byte{"/get.bin": src}}, sftp.ReadWrite())
+	srv, err := sftp.New(&ramFS{files: map[string][]byte{"/get.bin": src}, slow: 3 * time.Millisecond}, sftp.ReadWrite())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,5 +250,62 @@ func TestOpenSSHResumeAgainstConcurrentServer(t *testing.T) {
 	}
 	if sha256.Sum256(got) != sha256.Sum256(src) {
 		t.Fatalf("resumed file differs (%d bytes, want %d)", len(got), size)
+	}
+}
+
+// OpenSSH's client logs "server reordered ACKs" (sftp-client.c:2224, debug3,
+// so `-vvv`) when a WRITE status comes back past an earlier one, and a
+// download or upload interrupted after that cannot be resumed (lines
+// 1856-1859). Slow every third block in the driver, so that a server
+// answering as the work completes would reorder, and put a file: the
+// message must not appear.
+func TestOpenSSHRepliesStayInOrder(t *testing.T) {
+	sftpBin, err := exec.LookPath("sftp")
+	if err != nil {
+		if os.Getenv("SFTP_REQUIRE_OPENSSH") != "" {
+			t.Fatal("OpenSSH's sftp is required here")
+		}
+		t.Skip("OpenSSH is not installed")
+	}
+	const size = 8 << 20
+	src := make([]byte, size)
+	rand.Read(src)
+	ram := &ramFS{files: map[string][]byte{}, slow: 3 * time.Millisecond}
+	srv, err := sftp.New(ram, sftp.ReadWrite())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	sshPub, _ := ssh.NewPublicKey(pub)
+	addr, _, _, _ := harnessFor(t, Config{
+		AuthorizedKeys: []ssh.PublicKey{sshPub},
+		ServerForLogin: func(string, *ssh.Permissions) (*sftp.Server, error) { return srv, nil },
+	})
+	dir := t.TempDir()
+	key := filepath.Join(dir, "id")
+	blk, _ := ssh.MarshalPrivateKey(priv, "")
+	if err := os.WriteFile(key, pem.EncodeToMemory(blk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	up := filepath.Join(dir, "up.bin")
+	if err := os.WriteFile(up, src, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host, port, _ := strings.Cut(addr, ":")
+	cmd := exec.Command(sftpBin, "-vvv", "-b", "-", "-P", port, "-i", key,
+		"-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "alice@"+host)
+	cmd.Stdin = strings.NewReader("put " + up + " /put.bin\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("put: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "server reordered ACKs") {
+		t.Fatal("OpenSSH's client saw the server's replies out of order")
+	}
+	ram.mu.RLock()
+	defer ram.mu.RUnlock()
+	if sha256.Sum256(ram.files["/put.bin"]) != sha256.Sum256(src) {
+		t.Fatal("put: SHA-256 differs")
 	}
 }
