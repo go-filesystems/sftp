@@ -46,6 +46,8 @@ type Server struct {
 	maxTotal int
 	// packetWait is [WithPacketTimeout].
 	packetWait time.Duration
+	// replyBatch is [WithReplyBatch].
+	replyBatch int
 	// pathConcurrent is the embedder's assertion that the driver's
 	// read-only path calls (Stat, ListDir, ReadFile, ReadLink) are safe
 	// concurrently with each other and with File I/O. See [PathOpsConcurrent].
@@ -134,6 +136,34 @@ func (s *Server) packetTimeout() time.Duration {
 	return s.packetWait
 }
 
+// DefaultReplyBatch is how many bytes of replies a session coalesces into one
+// write of its channel unless [WithReplyBatch] says otherwise: eight 32 KiB SSH
+// packets.
+const DefaultReplyBatch = inflight.DefaultBatch
+
+// WithReplyBatch bounds the bytes of replies that leave in one write. Replies
+// that are ready together (they already leave in request order) are copied end
+// to end into one buffer and written once, so the SSH channel splits the bytes
+// into full packets instead of one short tail packet per reply, and a net.Conn
+// pays one syscall for several replies, as OpenSSH's sftp-server does by
+// writing its whole output queue at once (sftp-server.c, process_requests).
+//
+// Memory is unchanged: a reply's slot and token are released only after the
+// write, so the bytes held are what [WithMaxInFlight] and [WithMaxInFlightTotal]
+// already count; the session adds one buffer of at most n bytes. Zero means
+// [DefaultReplyBatch]; a negative value writes each reply on its own.
+func WithReplyBatch(n int) Option { return func(s *Server) { s.replyBatch = n } }
+
+func (s *Server) replyBatchBytes() int {
+	switch {
+	case s.replyBatch == 0:
+		return DefaultReplyBatch
+	case s.replyBatch < 0:
+		return 0
+	}
+	return s.replyBatch
+}
+
 // PathOpsConcurrent asserts that the driver's read-only path calls (Stat,
 // ListDir, ReadFile, ReadLink) may run concurrently with each other and with
 // File I/O, which lets the server run them in parallel. The interface module
@@ -211,6 +241,7 @@ func (s *Server) Serve(rw io.ReadWriter) error {
 	if err != nil {
 		return err
 	}
+	conn.SetBatch(s.replyBatchBytes())
 	sess := &session{srv: s, rw: rw, handles: newHandles(), conn: conn}
 	// run returns only after every request in flight has been answered, so
 	// closeAll never races a READ or WRITE still holding a driver file.

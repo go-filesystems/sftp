@@ -17,7 +17,7 @@ import (
 	fat32 "github.com/go-filesystems/fat32"
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // These are the unit tests for the command's own surface: argument parsing,

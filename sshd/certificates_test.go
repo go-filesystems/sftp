@@ -8,7 +8,7 @@ import (
 	"crypto/rand"
 
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // A key belongs to somebody. A server with several people on it must know

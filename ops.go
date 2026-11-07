@@ -547,7 +547,7 @@ func (s *session) readJob(m wire.ReadRequest) (*job, wire.Message) {
 			// File.ReadAt is documented safe for concurrent use: shared.
 			s.srv.fs.LockIO()
 			defer s.srv.fs.UnlockIO()
-			return frame(sl, s.readAt(m.ID, h.file, m.Offset, n, sl))
+			return s.readAt(m.ID, h.file, m.Offset, n, sl)
 		}
 		s.srv.rlock()
 		defer s.srv.runlock()
@@ -562,25 +562,29 @@ func (s *session) readJob(m wire.ReadRequest) (*job, wire.Message) {
 // File.Size is deliberately not consulted: ReadAt answers 0, io.EOF at or
 // past the end by contract, and Size of a writable file is not documented as
 // safe beside a concurrent WriteAt.
-func (s *session) readAt(id uint32, f filesystem.File, off uint64, n int, sl *inflight.Slot) wire.Message {
+func (s *session) readAt(id uint32, f filesystem.File, off uint64, n int, sl *inflight.Slot) ([]byte, error) {
 	if off > math.MaxInt64 {
-		return status(id, wire.StatusEOF, "")
+		return frame(sl, status(id, wire.StatusEOF, ""))
 	}
-	if cap(sl.Data) < n {
-		sl.Data = make([]byte, n)
+	// The file is read straight into the reply packet, after room for its
+	// header: no payload buffer and no copy into a framing buffer.
+	need := wire.DataHeaderLen + n
+	if cap(sl.Out) < need {
+		sl.Out = make([]byte, need)
 	}
-	buf := sl.Data[:n]
-	got, err := f.ReadAt(buf, int64(off))
+	sl.Out = sl.Out[:need]
+	got, err := f.ReadAt(sl.Out[wire.DataHeaderLen:], int64(off))
 	if got > 0 {
 		// io.ReaderAt may return data together with io.EOF. Sending the
 		// data and letting the NEXT read report EOF is what every client
 		// expects; reporting EOF now would drop the last bytes of the file.
-		return wire.DataReply{ID: id, Data: buf[:got]}
+		sl.Out, err = wire.FrameData(sl.Out, id, got)
+		return sl.Out, err
 	}
 	if err == nil || errors.Is(err, io.EOF) {
-		return status(id, wire.StatusEOF, "")
+		return frame(sl, status(id, wire.StatusEOF, ""))
 	}
-	return status(id, statusFor(err, wire.StatusFailure), errText(err))
+	return frame(sl, status(id, statusFor(err, wire.StatusFailure), errText(err)))
 }
 
 // readWhole serves a READ from a driver with no Opener, by reading the entire

@@ -17,7 +17,7 @@ import (
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp"
 	"github.com/go-filesystems/sftp/wire"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // No key in this file is ever written to disk. Every one is generated in
