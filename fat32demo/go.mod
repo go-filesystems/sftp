@@ -10,7 +10,7 @@ require (
 	github.com/go-filesystems/fat32 v0.10.0
 	github.com/go-filesystems/interface v0.5.0
 	github.com/go-filesystems/sftp v0.7.1
-	github.com/go-filesystems/ssh v0.0.0-20261107191258-9e959c8ce9fd
+	github.com/go-filesystems/ssh v0.1.0
 )
 
 require (
