@@ -210,6 +210,15 @@ requests may overlap and which byte range each touches.
   of a packet has `WithPacketTimeout` (30 s) to arrive once its first byte has,
   since the request holds its slot and token meanwhile; a packet that is late
   ends the session (the stream is closed, or given a past read deadline).
+- **Replies coalesced:** replies that are ready together (already in request
+  order) are written in ONE write of at most `WithReplyBatch` bytes (256 KiB by
+  default; a negative value writes each on its own). On an SSH channel this
+  turns a 32 KiB `READ` reply, which was one full packet plus a 13-byte tail
+  packet, into full packets, and OpenSSH's sftp-server does the same by writing
+  its whole output queue at once (sftp-server.c:2073-2113). Slots are freed
+  only after the write, so the memory bound above is unchanged; a session adds
+  one buffer of at most the batch size. A `READ` is read from the file straight
+  into its reply packet.
 
 ## The write path, measured
 

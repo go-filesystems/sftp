@@ -7,6 +7,35 @@ import (
 	"testing"
 )
 
+func TestFrameDataEqualsSendOfADataReply(t *testing.T) {
+	data := []byte("hello, sftp")
+	buf := make([]byte, DataHeaderLen+64)
+	copy(buf[DataHeaderLen:], data)
+	got, err := FrameData(buf, 77, len(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want bytes.Buffer
+	if _, err := Send(&want, DataReply{ID: 77, Data: data}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want.Bytes()) {
+		t.Fatalf("FrameData = %x, Send = %x", got, want.Bytes())
+	}
+}
+
+func TestFrameDataRefusesWhatCannotBeFramed(t *testing.T) {
+	for name, c := range map[string]struct{ buflen, n int }{
+		"negative":  {DataHeaderLen + 8, -1},
+		"too large": {MaxPacket + 64, MaxPacket},
+		"short buf": {DataHeaderLen + 2, 3},
+	} {
+		if _, err := FrameData(make([]byte, c.buflen), 1, c.n); !errors.Is(err, ErrPacketTooLarge) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Primitives
 // ---------------------------------------------------------------------------
