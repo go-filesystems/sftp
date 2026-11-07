@@ -5,7 +5,7 @@ go 1.27.3
 require (
 	github.com/go-filesystems/hostcopy v0.1.0
 	github.com/go-filesystems/inflight v0.2.0
-	github.com/go-filesystems/interface v0.5.0
+	github.com/go-filesystems/interface v0.6.0
 	github.com/go-filesystems/ssh v0.1.0
 )
 

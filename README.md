@@ -33,6 +33,15 @@ reach for:
 And the protocol brings what NFSv3 does not have at all: **public-key
 authentication and encryption**, built in rather than bolted on.
 
+**Timestamps.** A driver with `filesystem.TimesReader` (interface v0.6.0)
+supplies each file's real atime and mtime, in `stat` and in the `ls -l`
+longname. SFTP v3 carries them as one flagged pair of unsigned 32-bit seconds
+(draft-ietf-secsh-filexfer-02): a missing atime is the mtime; a missing mtime
+CLEARS the flag ("the server did not say") and the longname shows `??? ?? ??:??`
+instead of a date; before 1970 clamps to 0 and after 2106 to 2^32-1. A driver
+without the capability still reports the server's start time. Tested against
+OpenSSH's `sftp` (`ls -l`).
+
 ## Why it makes per-client isolation cheap
 
 > *"SFTP would let us isolate clients in their own file, in user space, with a
