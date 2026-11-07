@@ -66,7 +66,7 @@ func (s *session) opStat(m wire.PathRequest) wire.Message {
 		// session in the same process. It is answered as a failure instead.
 		return status(m.ID, wire.StatusFailure, "driver returned no stat")
 	}
-	return wire.AttrsReply{ID: m.ID, Attrs: s.srv.attrsFromStat(st)}
+	return wire.AttrsReply{ID: m.ID, Attrs: s.srv.attrsAt(path, st)}
 }
 
 // opFstat answers SSH_FXP_FSTAT: the same question against an open handle.
@@ -227,7 +227,7 @@ func (s *session) readdirBatch(h *openFile, batch []filesystem.DirEntry) []wire.
 			// size will act on the size.
 			continue
 		}
-		a := s.srv.attrsFromStat(st)
+		a := s.srv.attrsAt(full, st)
 		items = append(items, wire.NameItem{
 			Filename: name,
 			Longname: longName(name, a),

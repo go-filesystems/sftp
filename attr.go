@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -13,12 +14,10 @@ import (
 // [github.com/go-filesystems/interface.Stat] may implement to report a real
 // modification time.
 //
-// No driver in the fleet does today, so every file this server exports
-// currently carries the server's start time in atime and mtime. That is
-// visibly wrong in a client's listing and is reported here rather than
-// hidden: the fix is a timestamp accessor on interface.Stat, not a plausible
-// guess in this module. The probe exists so the day a driver reports one, the
-// listing gets it without a change here.
+// It is the older probe, kept for a Stat that carries its own time. A
+// filesystem with [filesystem.TimesReader] (interface v0.6.0) takes precedence
+// over it (see attrsAt), and a driver with neither carries the server's start
+// time in atime and mtime for every file.
 type TimeStat interface {
 	ModTime() int64 // seconds since the Unix epoch
 }
@@ -61,6 +60,61 @@ func (s *Server) attrsFromStat(st filesystem.Stat) wire.Attributes {
 	return a
 }
 
+// attrsAt is attrsFromStat with the times the filesystem records for path, when
+// it can say (filesystem.TimesReader); without the capability, or when its call
+// fails, the result is attrsFromStat's.
+//
+// ATTRS version 3 carries atime and mtime as ONE flagged pair of uint32 seconds
+// since 1970 (draft-ietf-secsh-filexfer-02 section 5, SSH_FILEXFER_ATTR_ACMODTIME):
+// there is no way to flag one without the other, no sub-second part, no ctime and
+// no birth time. So:
+//
+//   - mtime recorded: the pair is sent; a missing atime is the mtime.
+//   - mtime not recorded: the flag is CLEARED, which is the protocol's own way
+//     to say "the server did not say"; the format's atime alone is not worth a
+//     mtime that would be invented.
+//   - a time before 1970 clamps to 0 and one after 2106 to 2^32-1: the field is
+//     unsigned and 32 bits wide.
+func (s *Server) attrsAt(path string, st filesystem.Stat) wire.Attributes {
+	a := s.attrsFromStat(st)
+	tr, ok := s.fsys.(filesystem.TimesReader)
+	if !ok {
+		return a
+	}
+	ft, err := tr.Times(path)
+	if err != nil {
+		return a
+	}
+	mt, ok := seconds32(ft.Mtime)
+	if !ok {
+		a.Flags &^= wire.AttrACModTime
+		a.Atime, a.Mtime = 0, 0
+		return a
+	}
+	at, ok := seconds32(ft.Atime)
+	if !ok {
+		at = mt
+	}
+	a.Atime, a.Mtime = at, mt
+	return a
+}
+
+// seconds32 returns a Timestamp as the unsigned 32-bit seconds ATTRS carries.
+func seconds32(ts filesystem.Timestamp) (uint32, bool) {
+	t, ok := ts.Get()
+	if !ok {
+		return 0, false
+	}
+	switch u := t.Unix(); {
+	case u < 0:
+		return 0, true
+	case u > math.MaxUint32:
+		return math.MaxUint32, true
+	default:
+		return uint32(u), true
+	}
+}
+
 // longName renders one directory entry in `ls -l` form for the longname field
 // of a NAME reply.
 //
@@ -79,7 +133,12 @@ func longName(name string, a wire.Attributes) string {
 	b.WriteByte(' ')
 	b.WriteString(strconv.FormatUint(a.Size, 10))
 	b.WriteByte(' ')
-	b.WriteString(time.Unix(int64(a.Mtime), 0).UTC().Format("Jan _2 15:04"))
+	if a.Flags&wire.AttrACModTime != 0 {
+		b.WriteString(time.Unix(int64(a.Mtime), 0).UTC().Format("Jan _2 15:04"))
+	} else {
+		// No time was given: say so, rather than print 1970.
+		b.WriteString("??? ?? ??:??")
+	}
 	b.WriteByte(' ')
 	b.WriteString(name)
 	return b.String()
