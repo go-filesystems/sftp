@@ -9,6 +9,6 @@ require (
 )
 
 require (
-	github.com/go-filesystems/inflight v0.1.0 // indirect
+	github.com/go-filesystems/inflight v0.1.1-0.20261107103530-dae5057bc48a // indirect
 	golang.org/x/sys v0.49.0 // indirect
 )

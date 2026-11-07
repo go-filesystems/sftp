@@ -97,3 +97,24 @@ func WritePacket(w io.Writer, typ uint8, payload []byte, out []byte) ([]byte, er
 	_, err := w.Write(out)
 	return out, err
 }
+
+// DataHeaderLen is what precedes the data of a framed SSH_FXP_DATA packet: the
+// 4-byte length, the type, the 4-byte id and the 4-byte data length.
+const DataHeaderLen = 4 + 1 + 4 + 4
+
+// FrameData completes the SSH_FXP_DATA packet whose n data bytes the caller has
+// already put at buf[DataHeaderLen:DataHeaderLen+n], by writing the header in
+// front of them, and returns buf[:DataHeaderLen+n]. It is what [Send] with a
+// [DataReply] produces, without building the payload in a second buffer and
+// copying it into a third: the file is read straight into the packet.
+func FrameData(buf []byte, id uint32, n int) ([]byte, error) {
+	total := DataHeaderLen - 4 + n
+	if n < 0 || uint64(total) > uint64(MaxPacket) || len(buf) < DataHeaderLen+n {
+		return buf, ErrPacketTooLarge
+	}
+	binary.BigEndian.PutUint32(buf[0:4], uint32(total))
+	buf[4] = FxpData
+	binary.BigEndian.PutUint32(buf[5:9], id)
+	binary.BigEndian.PutUint32(buf[9:13], uint32(n))
+	return buf[:DataHeaderLen+n], nil
+}
