@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // OpenSSH's own client, presenting a certificate OpenSSH's own ssh-keygen

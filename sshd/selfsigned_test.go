@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // A certificate no trusted authority signed -- an OpenPubkey (opkssh) one,

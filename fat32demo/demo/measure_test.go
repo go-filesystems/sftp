@@ -14,7 +14,7 @@ import (
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp"
 	"github.com/go-filesystems/sftp/sshd"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // This file measures the two write paths against each other on a REAL image,

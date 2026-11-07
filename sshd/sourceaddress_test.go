@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // The test server listens on 127.0.0.1 and every client dials it from there,

@@ -11,7 +11,7 @@ import (
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp"
 	"github.com/go-filesystems/sftp/wire"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // Two additions, and they answer one question between them: WHO is asking, and

@@ -132,7 +132,7 @@ address, IPv6 included, and not merely against "loopback".
 |---|---|---|
 | `wire/` | **nothing but the standard library** | the v3 packet codec |
 | `.` | `interface`, `wire` | the SFTP subsystem over a `Filesystem` |
-| `sshd/` | `.`, `golang.org/x/crypto/ssh` | the SSH front-end |
+| `sshd/` | `.`, `go-filesystems/ssh` (fork of `golang.org/x/crypto/ssh`) | the SSH front-end |
 
 **The codec is deliberately isolated.** `wire` imports neither the filesystem
 interface nor the server — it is checked, not merely intended. The reason is
@@ -142,7 +142,12 @@ extraction is a **move rather than a rewrite**. `go-filesystems/nfs` made the
 same split with its `xdr/` and `rpc/` packages.
 
 Cryptography is **not** reimplemented: the transport is
-`golang.org/x/crypto/ssh`. The SFTP subsystem itself
+[`github.com/go-filesystems/ssh`](https://github.com/go-filesystems/ssh), a fork
+of `golang.org/x/crypto/ssh` with one change: it flushes once per channel
+`Write` through a 64 KiB buffer instead of once per packet through a 4 KiB one,
+so a 32 KiB packet is one `write(2)` and not two (96 writes per MiB sent become
+32). The fork's API is that of x/crypto/ssh and it is meant to go back
+upstream. The SFTP subsystem itself
 (`draft-ietf-secsh-filexfer-02`, **version 3** — what every client actually
 speaks) is implemented here, because the protocol is the thing this repository
 is *for*.

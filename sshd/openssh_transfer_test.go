@@ -21,7 +21,7 @@ import (
 
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // ramFS is a writable in-memory Filesystem whose Files read and write at an

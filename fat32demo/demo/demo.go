@@ -35,7 +35,7 @@ import (
 	fat32 "github.com/go-filesystems/fat32"
 	"github.com/go-filesystems/sftp"
 	"github.com/go-filesystems/sftp/sshd"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // ErrNoImage reports the required -image flag missing. It is a distinct error

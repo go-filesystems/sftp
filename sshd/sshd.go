@@ -39,7 +39,7 @@ import (
 	"sync"
 
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // keyRand is the entropy source for [GenerateHostKey], indirected so a test

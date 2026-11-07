@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/go-filesystems/sftp"
-	"golang.org/x/crypto/ssh"
+	"github.com/go-filesystems/ssh"
 )
 
 // sourceaddress_test.go dials from 127.0.0.1 and nothing else, so it cannot
