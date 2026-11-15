@@ -29,6 +29,9 @@ func (s *Server) extensions() []wire.ExtendedPair {
 	if s.copiesData() {
 		ext = append(ext, wire.ExtendedPair{Type: copyDataExtension, Data: "1"})
 	}
+	if s.syncs() {
+		ext = append(ext, wire.ExtendedPair{Type: fsyncExtension, Data: "1"})
+	}
 	return ext
 }
 

@@ -295,6 +295,8 @@ func (s *session) dispatch(typ uint8, payload []byte) wire.Message {
 			return s.limitsReply(m.ID)
 		case copyDataExtension:
 			return s.copyData(m.ID, m.Data)
+		case fsyncExtension:
+			return s.fsync(m.ID, m.Data)
 		}
 		// Any other extension is one this server did not advertise, so a
 		// client asking for it is asking for something it was told nothing
