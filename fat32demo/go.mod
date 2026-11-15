@@ -1,6 +1,11 @@
 module github.com/go-filesystems/sftp/fat32demo
 
-go 1.27.3
+// Raised with the root module on 2026-11-15 for GO-2026-6859 (net/http, fixed
+// in 1.27.4); the reasoning is in ../go.mod.
+//
+// ⛔ A NESTED MODULE KEEPS ITS OWN DIRECTIVE, so a raise that stops at the root
+// leaves this one behind and the sweep keeps reporting the repository.
+go 1.27.4
 
 // The demo is versioned with the server it demonstrates: it must build
 // against the working tree, not against whatever the proxy last published.
