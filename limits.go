@@ -30,6 +30,15 @@ const (
 	// without a bound one authenticated user could spend every descriptor
 	// the server process has, for every other user too.
 	maxOpenHandles = 1024
+
+	// maxRetainedEntries is how many directory entries one session's open
+	// directory handles may hold between them. OPENDIR keeps the whole listing
+	// in the handle, so a count of handles alone lets 1024 of them hold 1024
+	// copies of a large directory (about 48 bytes per entry in the audit's
+	// measurement, 236 MiB for 256 handles of 20000 entries). 1<<18 entries
+	// is about 12 MiB per session by that measure; a single listing larger
+	// than that is still allowed, once (see handles.dirFull).
+	maxRetainedEntries = 1 << 18
 )
 
 var errTooManyHandles = errors.New("too many open handles")

@@ -94,6 +94,17 @@ type openFile struct {
 // consequence of it rather than an oversight.
 type handles struct {
 	m map[string]*openFile
+	// retained is the number of directory entries the table holds in open
+	// directory handles; see [maxRetainedEntries].
+	retained int
+}
+
+// dirFull reports whether a listing of n entries would take the session past
+// its budget of retained directory entries. A session may always hold ONE
+// listing, however large the driver made it, so a huge directory stays
+// readable; what it may not do is open it again and again.
+func (t *handles) dirFull(n int) bool {
+	return t.retained > 0 && t.retained+n > maxRetainedEntries
 }
 
 // newHandles returns an empty table.
@@ -112,6 +123,7 @@ func (t *handles) add(h *openFile) (string, error) {
 	}
 	tok := hex.EncodeToString(b[:])
 	t.m[tok] = h
+	t.retained += len(h.entries)
 	return tok, nil
 }
 
@@ -134,6 +146,7 @@ func (t *handles) remove(tok string) (*openFile, bool) {
 	h, ok := t.m[tok]
 	if ok {
 		delete(t.m, tok)
+		t.retained -= len(h.entries)
 	}
 	return h, ok
 }

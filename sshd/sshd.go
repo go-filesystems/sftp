@@ -37,7 +37,9 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
+	"github.com/go-filesystems/inflight"
 	"github.com/go-filesystems/sftp"
 	"github.com/go-filesystems/ssh"
 )
@@ -177,7 +179,40 @@ type Config struct {
 
 	// Banner, if non-empty, is sent to the client before authentication.
 	Banner string
+
+	// LoginGraceTime is how long a connection has to finish the SSH handshake
+	// and authenticate, like OpenSSH's LoginGraceTime. Zero means
+	// [DefaultLoginGraceTime]; a negative value disables the deadline. A peer
+	// that connects and says nothing is dropped when it expires, instead of
+	// holding a goroutine and a descriptor for ever.
+	LoginGraceTime time.Duration
+
+	// MaxStartups caps the connections that have not authenticated yet, like
+	// OpenSSH's MaxStartups. Zero means [DefaultMaxStartups]; negative removes
+	// the cap. A connection over the cap is closed at once.
+	MaxStartups int
+
+	// MaxStartupsPerHost caps the unauthenticated connections from one source
+	// address. Zero means [DefaultMaxStartupsPerHost]; negative removes the
+	// cap. It matters behind a NAT or proxy, where many users share one
+	// address: raise it there.
+	MaxStartupsPerHost int
 }
+
+// Defaults for the pre-authentication bounds of [Config].
+const (
+	// DefaultLoginGraceTime is OpenSSH's own default (120 s), halved: a key
+	// exchange and a public-key login need a few round trips, not a minute.
+	DefaultLoginGraceTime = 60 * time.Second
+	// DefaultMaxStartups is OpenSSH's full threshold for MaxStartups.
+	DefaultMaxStartups = 100
+	// DefaultMaxStartupsPerHost keeps one address from using the whole cap.
+	DefaultMaxStartupsPerHost = 20
+)
+
+// ErrTooManyStartups is returned by [Server.HandleConn] for a connection
+// refused because too many connections were still unauthenticated.
+var ErrTooManyStartups = errors.New("sshd: too many unauthenticated connections")
 
 // Server accepts SSH connections and serves the SFTP subsystem on them.
 //
@@ -198,6 +233,11 @@ type Server struct {
 	serverFor      func(user string) (*sftp.Server, error)
 	serverForLogin func(user string, perms *ssh.Permissions) (*sftp.Server, error)
 	cfg            *ssh.ServerConfig
+
+	// grace is the handshake deadline (0: none); gate bounds connections still
+	// unauthenticated (nil: unbounded).
+	grace time.Duration
+	gate  *inflight.Gate
 
 	mu     sync.Mutex
 	closed bool
@@ -299,7 +339,47 @@ func New(srv *sftp.Server, cfg Config) (*Server, error) {
 	for _, k := range cfg.HostKeys {
 		sc.AddHostKey(k)
 	}
-	return &Server{sftp: srv, serverFor: cfg.ServerFor, serverForLogin: cfg.ServerForLogin, cfg: sc, conns: make(map[net.Conn]struct{})}, nil
+	d := &Server{sftp: srv, serverFor: cfg.ServerFor, serverForLogin: cfg.ServerForLogin, cfg: sc, conns: make(map[net.Conn]struct{})}
+	switch {
+	case cfg.LoginGraceTime == 0:
+		d.grace = DefaultLoginGraceTime
+	case cfg.LoginGraceTime > 0:
+		d.grace = cfg.LoginGraceTime
+	}
+	d.gate = startupGate(cfg.MaxStartups, cfg.MaxStartupsPerHost)
+	return d, nil
+}
+
+// startupGate resolves the two caps of a Config: zero is the default, negative
+// is no cap on that axis.
+func startupGate(total, perHost int) *inflight.Gate {
+	if total == 0 {
+		total = DefaultMaxStartups
+	}
+	if perHost == 0 {
+		perHost = DefaultMaxStartupsPerHost
+	}
+	switch {
+	case total < 0 && perHost < 0:
+		return nil
+	case total < 0:
+		total = int(^uint(0) >> 1)
+	case perHost < 0:
+		perHost = total
+	}
+	return inflight.NewKeyGate(total, perHost)
+}
+
+// sourceKey is the address a connection came from, without its port.
+func sourceKey(c net.Conn) string {
+	a := c.RemoteAddr()
+	if a == nil {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(a.String()); err == nil {
+		return h
+	}
+	return a.String()
 }
 
 // GenerateHostKey returns a fresh in-memory Ed25519 host key.
@@ -482,7 +562,41 @@ func (d *Server) HandleConn(c net.Conn) (err error) {
 		}
 	}()
 
-	conn, chans, reqs, err := ssh.NewServerConn(c, d.cfg)
+	// Until the client has authenticated it is untrusted and costs a goroutine
+	// and a descriptor: cap how many such connections exist, and give each a
+	// deadline, so a peer that sends nothing cannot hold either for ever.
+	var (
+		conn  *ssh.ServerConn
+		chans <-chan ssh.NewChannel
+		reqs  <-chan *ssh.Request
+		left  bool
+	)
+	if d.gate != nil {
+		key := sourceKey(c)
+		if !d.gate.TryEnterKey(key) {
+			return ErrTooManyStartups
+		}
+		// Left even if the handshake panics (the recover above contains it).
+		defer func() {
+			if left {
+				return
+			}
+			d.gate.LeaveKey(key)
+		}()
+	}
+	handshake := func() (herr error) {
+		conn, chans, reqs, herr = ssh.NewServerConn(c, d.cfg)
+		return herr
+	}
+	if d.grace > 0 {
+		err = inflight.WithDeadline(c, d.grace, handshake)
+	} else {
+		err = handshake()
+	}
+	if d.gate != nil {
+		d.gate.LeaveKey(sourceKey(c))
+		left = true
+	}
 	if err != nil {
 		// Includes every authentication failure, which is the common case
 		// on a reachable port and is not remarkable.

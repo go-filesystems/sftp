@@ -168,7 +168,9 @@ Two, both answered, and nothing advertised that is not:
 - **`limits@openssh.com`** (since v0.6.0): the server's packet, read and
   write lengths and open-handle bound, so OpenSSH's `sftp` reads and writes
   up to 255 KiB per request instead of 32 KiB (about +25% measured with
-  OpenSSH 10.3). One session holds at most 1024 open handles.
+  OpenSSH 10.3). One session holds at most 1024 open handles, and the
+  directory listings kept by its open `OPENDIR` handles hold at most 262144
+  entries between them (one listing is always allowed, however large).
 - **`copy-data`** (since v0.7.0), what OpenSSH 9.0+'s `sftp cp` sends: a copy
   from one open handle into another on the server, through
   [`hostcopy`](https://github.com/go-filesystems/hostcopy) -- a megabyte at
