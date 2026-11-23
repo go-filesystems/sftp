@@ -485,33 +485,39 @@ func (d *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		d.track(c, true)
-		d.wg.Add(1)
-		go func() {
-			defer d.wg.Done()
-			defer d.track(c, false)
-			// A failed connection is one client's problem. It must not end
-			// the accept loop, and it must not be a panic path: everything
-			// below returns errors.
-			_ = d.HandleConn(c)
-		}()
+		if d.admit(c) {
+			go func() {
+				defer d.wg.Done()
+				defer d.untrack(c)
+				// A failed connection is one client's problem. It must not end
+				// the accept loop, and it must not be a panic path: everything
+				// below returns errors.
+				_ = d.HandleConn(c)
+			}()
+		}
 	}
 }
 
-// track adds or removes a connection from the set Close will drop.
-func (d *Server) track(c net.Conn, add bool) {
+// admit adds a connection to the set Close will drop and counts its handler,
+// under the same lock that sets closed: a WaitGroup Add must not race with the
+// Wait in Close, and a connection that raced with Close is closed here, since
+// nothing will come back for it.
+func (d *Server) admit(c net.Conn) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if add {
-		if d.closed {
-			// Raced with Close: never leave the connection open, since
-			// nothing will come back for it.
-			c.Close()
-			return
-		}
-		d.conns[c] = struct{}{}
-		return
+	if d.closed {
+		c.Close()
+		return false
 	}
+	d.conns[c] = struct{}{}
+	d.wg.Add(1)
+	return true
+}
+
+// untrack removes a connection from the set Close will drop.
+func (d *Server) untrack(c net.Conn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	delete(d.conns, c)
 	c.Close()
 }

@@ -493,7 +493,9 @@ func TestConnectionArrivingDuringCloseIsNotLeaked(t *testing.T) {
 	d.Close()
 	a, b := net.Pipe()
 	defer a.Close()
-	d.track(b, true)
+	if d.admit(b) {
+		t.Fatal("a connection arriving after Close was admitted")
+	}
 	if len(d.conns) != 0 {
 		t.Fatal("a connection arriving after Close was tracked")
 	}

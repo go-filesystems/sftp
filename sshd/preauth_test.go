@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/go-filesystems/ssh"
 )
 
 // dropped reports whether the server has closed c: a read returns EOF or a
@@ -147,3 +149,32 @@ type addrConn struct {
 }
 
 func (c *addrConn) RemoteAddr() net.Addr { return c.addr }
+
+// A negative LoginGraceTime disables the deadline: a handshake still works,
+// and the slot is still given back.
+func TestNoLoginGraceTime(t *testing.T) {
+	addr, _, hostPub, d := harness(t, tinyFS{files: map[string][]byte{}}, func(c *Config) {
+		c.LoginGraceTime = -1
+		c.Password = func(string, string) bool { return true }
+	})
+	ch, done, err := channelAs(t, addr, hostPub, "alice", ssh.Password("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ch
+	done()
+	waitHeld(t, d, 0)
+}
+
+// A handshake that panics (a callback the caller supplied) still gives its
+// startup slot back.
+func TestStartupSlotReleasedWhenHandshakePanics(t *testing.T) {
+	addr, _, hostPub, d := harness(t, tinyFS{files: map[string][]byte{}}, func(c *Config) {
+		c.Password = func(string, string) bool { panic("a caller's callback") }
+	})
+	if _, done, err := channelAs(t, addr, hostPub, "trouble", ssh.Password("x")); err == nil {
+		done()
+		t.Fatal("a connection whose handshake panicked was served")
+	}
+	waitHeld(t, d, 0)
+}
