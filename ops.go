@@ -172,6 +172,9 @@ func (s *session) opOpendir(m wire.PathRequest) wire.Message {
 	if err != nil {
 		return status(m.ID, statusFor(err, wire.StatusFailure), errText(err))
 	}
+	if s.handles.dirFull(len(entries)) {
+		return status(m.ID, wire.StatusFailure, "too many open directory listings")
+	}
 	tok, err := s.handles.add(&openFile{path: path, dir: true, entries: entries})
 	if err != nil {
 		return status(m.ID, wire.StatusFailure, errText(err))
